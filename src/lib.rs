@@ -11,6 +11,8 @@ pub mod event;
 mod atom;
 pub mod cell;
 pub mod channel;
+pub mod util;
+pub mod waitgroup;
 
 #[cfg(feature = "executor")]
 pub mod executor;
