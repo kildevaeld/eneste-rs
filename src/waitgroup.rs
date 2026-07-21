@@ -1,11 +1,25 @@
 use alloc::rc::Rc;
-use core::cell::Cell;
+use core::{cell::Cell, fmt};
 
 use crate::{event::Event, util::next};
 
 pub struct WaitGroup {
     event: Rc<Event>,
     tickets: Rc<Cell<usize>>,
+}
+
+impl Default for WaitGroup {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Debug for WaitGroup {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Waitgroup")
+            .field("tickets", &self.tickets)
+            .finish()
+    }
 }
 
 impl WaitGroup {
@@ -50,6 +64,12 @@ impl WaitGroup {
 pub struct Ticket {
     event: Rc<Event>,
     tickets: Rc<Cell<usize>>,
+}
+
+impl fmt::Debug for Ticket {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Ticket").finish()
+    }
 }
 
 impl Drop for Ticket {
