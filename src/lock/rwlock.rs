@@ -8,6 +8,7 @@ use pin_project_lite::pin_project;
 
 use crate::event::Event;
 
+#[derive(Debug)]
 struct RwLockInner<T> {
     value: UnsafeCell<T>,
     event: Event,
@@ -47,6 +48,7 @@ impl<T> RwLockInner<T> {
     }
 }
 
+#[derive(Debug)]
 pub struct RwLock<T>(Rc<RwLockInner<T>>);
 
 impl<T> RwLock<T> {
