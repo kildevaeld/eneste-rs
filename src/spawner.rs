@@ -1,17 +1,8 @@
+use goerdet::LocalSpawner;
+
 use crate::{Downgrade, Upgrade};
 
-pub trait Spawner<'a> {
-    type Task: SpawnTask;
-    fn spawn<'b: 'a, F>(&self, task: F) -> Self::Task
-    where
-        F: Future<Output = ()> + 'b;
-}
-
-pub trait SpawnTask {
-    fn detach(self);
-}
-
-pub trait SpawnerExt<'a>: Spawner<'a> {
+pub trait SpawnerExt<'a>: LocalSpawner<'a> {
     fn spawn_task<'b: 'a, F, U>(&self, task: F) -> Self::Task
     where
         F: FnOnce(Self) -> U,
@@ -41,23 +32,10 @@ pub trait SpawnerExt<'a>: Spawner<'a> {
     }
 }
 
-impl<'a, T> SpawnerExt<'a> for T where T: Spawner<'a> {}
+impl<'a, T> SpawnerExt<'a> for T where T: LocalSpawner<'a> {}
 
-pub trait DriverableSpawner<'a>: Spawner<'a> {
+pub trait DriverableSpawner<'a>: LocalSpawner<'a> {
     fn tick(&self) -> bool;
-}
-
-#[cfg(feature = "compio")]
-impl Spawner<'static> for compio::runtime::Runtime {
-    type Task = CompioTask;
-
-    fn spawn<'b: 'static, F>(&self, task: F) -> Self::Task
-    where
-        F: Future<Output = ()> + 'b,
-    {
-        let inner = self.spawn(task);
-        CompioTask { inner }
-    }
 }
 
 #[cfg(feature = "compio")]
@@ -71,17 +49,5 @@ impl DriverableSpawner<'static> for compio::runtime::Runtime {
         }
 
         remaining_tasks
-    }
-}
-
-#[cfg(feature = "compio")]
-pub struct CompioTask {
-    inner: compio::runtime::JoinHandle<()>,
-}
-
-#[cfg(feature = "compio")]
-impl SpawnTask for CompioTask {
-    fn detach(self) {
-        self.inner.detach();
     }
 }

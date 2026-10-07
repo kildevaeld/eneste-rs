@@ -1,39 +1,41 @@
-use alloc::fmt;
+use core::cell::Cell;
 
-use crate::{emitter::EventTarget, event::Event};
+use alloc::{
+    fmt,
+    rc::{Rc, Weak},
+};
+
+use crate::{Downgrade, Upgrade, emitter::EventTarget, event::Event};
 
 pub struct ObservableCell<T> {
-    value: T,
-    event: Event<()>,
+    value: Rc<(Cell<T>, Event<()>)>,
 }
 
-impl<T: Clone> Clone for ObservableCell<T> {
+impl<T: Copy> Clone for ObservableCell<T> {
     fn clone(&self) -> Self {
         Self {
-            value: self.value.clone(),
-            event: Event::new(),
+            value: Rc::new((Cell::new(self.value.0.get()), Event::new())),
         }
     }
 }
 
-impl<T: PartialEq> ObservableCell<T> {
+impl<T: PartialEq + Copy> ObservableCell<T> {
     pub fn new(value: T) -> Self {
         Self {
-            value,
-            event: Event::new(),
+            value: Rc::new((Cell::new(value), Event::new())),
         }
     }
 
-    pub fn get(&self) -> &T {
+    pub fn get(&self) -> T {
         // SAFETY: We ensure exclusive access through the event system.
-        &self.value
+        self.value.0.get()
     }
 
     pub fn set(&mut self, value: T) {
         // SAFETY: We ensure exclusive access through the event system.
-        if self.value != value {
-            self.value = value;
-            self.event.notify(usize::MAX);
+        if self.value.0.get() != value {
+            self.value.0.set(value);
+            self.value.1.notify(usize::MAX);
         }
     }
 }
@@ -42,13 +44,11 @@ impl<T> EventTarget<()> for ObservableCell<T> {
     type Stream = crate::event::EventStream<()>;
 
     fn subscribe(&self) -> Self::Stream {
-        self.event.stream()
+        self.value.1.stream()
     }
 }
 
-// pub struct WeakObservableCell<T>(Weak<Inner<T>>);
-
-impl<T: fmt::Debug> fmt::Debug for ObservableCell<T>
+impl<T: fmt::Debug + Copy> fmt::Debug for ObservableCell<T>
 where
     T: Clone + PartialEq,
 {
@@ -59,9 +59,35 @@ where
     }
 }
 
-impl<T: PartialEq> PartialEq for ObservableCell<T> {
+impl<T: PartialEq + Copy> PartialEq for ObservableCell<T> {
     fn eq(&self, other: &Self) -> bool {
         self.get() == other.get()
+    }
+}
+
+impl<T> Eq for ObservableCell<T> where T: Eq + Copy {}
+
+impl<T> Downgrade for ObservableCell<T> {
+    type Target = WeakObservableCell<T>;
+
+    fn downgrade(&self) -> Self::Target {
+        WeakObservableCell(Rc::downgrade(&self.value))
+    }
+}
+
+pub struct WeakObservableCell<T>(Weak<(Cell<T>, Event<()>)>);
+
+impl<T> Clone for WeakObservableCell<T> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl<T> Upgrade for WeakObservableCell<T> {
+    type Target = ObservableCell<T>;
+
+    fn upgrade(&self) -> Option<Self::Target> {
+        self.0.upgrade().map(|value| ObservableCell { value })
     }
 }
 
@@ -127,14 +153,14 @@ mod tests {
     #[test]
     fn new_starts_with_initial_value() {
         let cell = ObservableCell::new(42);
-        assert_eq!(cell.get(), &42);
+        assert_eq!(cell.get(), 42);
     }
 
     #[test]
     fn set_updates_stored_value() {
         let mut cell = ObservableCell::new(10);
         cell.set(20);
-        assert_eq!(cell.get(), &20);
+        assert_eq!(cell.get(), 20);
     }
 
     #[test]

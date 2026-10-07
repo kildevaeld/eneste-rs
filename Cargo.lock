@@ -199,6 +199,7 @@ dependencies = [
  "compio",
  "futures-core",
  "futures-sink",
+ "goerdet",
  "pin-project-lite",
  "pollster",
 ]
@@ -302,6 +303,15 @@ dependencies = [
  "rustversion",
  "windows-link",
  "windows-result",
+]
+
+[[package]]
+name = "goerdet"
+version = "0.1.0"
+source = "git+https://github.com/kildevaeld/goerdet#d68186bfee8227fd954fb360a756d390cbec5faf"
+dependencies = [
+ "compio",
+ "compio-executor",
 ]
 
 [[package]]

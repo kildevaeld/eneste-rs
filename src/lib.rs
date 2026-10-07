@@ -11,6 +11,7 @@ pub mod event;
 mod atom;
 pub mod cell;
 pub mod channel;
+pub mod ref_cell;
 pub mod util;
 pub mod waitgroup;
 

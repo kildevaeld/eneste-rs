@@ -5,12 +5,12 @@ use core::{
 
 use alloc::rc::{Rc, Weak};
 use futures_core::Stream;
+use goerdet::LocalSpawner;
 use pin_project_lite::pin_project;
 
 use crate::{
     Downgrade,
     event::{Event, EventListener, NotificationExt},
-    spawner::Spawner,
     upgrade::Upgrade,
 };
 
@@ -185,29 +185,66 @@ where
 pub trait EventTargetExt<T>: EventTarget<T> + Sized {
     fn listen<'a, F, S>(&self, spawner: &S, map: F) -> S::Task
     where
-        S: Spawner<'a>,
+        S: LocalSpawner<'a>,
         F: FnMut(T) -> bool + 'a,
         Self::Stream: 'a,
     {
         spawner.spawn(Listener::new(self.subscribe(), map))
     }
 
-    fn listen_with<'a, F, W, S>(&self, spawner: &S, value: W, mut map: F) -> S::Task
+    fn listen_with<'a, F, W, S>(&self, spawner: &S, value: &W, mut map: F) -> S::Task
     where
-        S: Spawner<'a>,
+        S: LocalSpawner<'a>,
         W: Downgrade,
         W::Target: Upgrade + 'a,
         F: FnMut(<W::Target as Upgrade>::Target, T) -> bool + 'a,
         Self::Stream: 'a,
     {
         let downgraded_value = value.downgrade();
-
         self.listen(spawner, move |event| {
             let Some(strong_self) = downgraded_value.upgrade() else {
                 return false;
             };
 
             map(strong_self, event)
+        })
+    }
+
+    fn listen_with_this<'a, F, S>(&self, spawner: &S, mut map: F) -> S::Task
+    where
+        Self: Downgrade,
+        Self::Target: 'a,
+        S: LocalSpawner<'a>,
+        F: FnMut(<Self::Target as Upgrade>::Target, T) -> bool + 'a,
+        Self::Stream: 'a,
+    {
+        let downgraded_value = self.downgrade();
+        self.listen(spawner, move |event| {
+            let Some(strong_self) = downgraded_value.upgrade() else {
+                return false;
+            };
+
+            map(strong_self, event)
+        })
+    }
+
+    fn listen_with_this_and<'a, F, W, S>(&self, spawner: &S, value: &W, mut map: F) -> S::Task
+    where
+        Self: Downgrade,
+        Self::Target: 'a,
+        W: Downgrade,
+        W::Target: Upgrade + 'a,
+        S: LocalSpawner<'a>,
+        F: FnMut(<Self::Target as Upgrade>::Target, <W::Target as Upgrade>::Target, T) -> bool + 'a,
+        Self::Stream: 'a,
+    {
+        let downgraded_value = value.downgrade();
+        self.listen_with_this(spawner, move |this, event| {
+            let Some(strong) = downgraded_value.upgrade() else {
+                return false;
+            };
+
+            map(this, strong, event)
         })
     }
 }
