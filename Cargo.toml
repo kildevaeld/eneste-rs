@@ -19,4 +19,4 @@ compio = { version = "0.19", optional = true }
 
 
 [dev-dependencies]
-pollster = "0.4"
+pollster = "1.0"

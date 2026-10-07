@@ -229,15 +229,9 @@ impl<T> core::ops::Deref for RcReadLockGuard<T> {
     }
 }
 
-impl<T> core::ops::DerefMut for RcReadLockGuard<T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        unsafe { &mut *self.lock.value.get() }
-    }
-}
-
 impl<T> Drop for RcReadLockGuard<T> {
     fn drop(&mut self) {
-        self.lock.unlock();
+        self.lock.decrement_readers();
     }
 }
 
@@ -264,8 +258,8 @@ impl<T> Future for RcReadLockFuture<T> {
                     Poll::Pending => return Poll::Pending,
                 },
                 LockStateProj::Idle => {
-                    if this.lock.can_write() {
-                        this.lock.lock();
+                    if this.lock.can_read() {
+                        this.lock.increment_readers();
                         return Poll::Ready(RcReadLockGuard {
                             lock: Rc::clone(&this.lock),
                         });
@@ -541,5 +535,158 @@ mod tests {
 
         let reader = pollster::block_on(lock.read());
         assert_eq!(*reader, 10);
+    }
+}
+
+#[cfg(test)]
+mod behavior_tests {
+    use super::*;
+    use crate::test_util::{counting_waker, poll_once, poll_with};
+    use core::pin::pin;
+
+    #[test]
+    fn multiple_readers_can_hold_the_lock_at_once() {
+        let lock = RwLock::new(4);
+        let a = pollster::block_on(lock.read());
+        let b = pollster::block_on(lock.read());
+        let c = pollster::block_on(lock.read());
+
+        assert_eq!(*a + *b + *c, 12);
+    }
+
+    #[test]
+    fn writer_waits_for_every_reader() {
+        let lock = RwLock::new(0);
+        let first = pollster::block_on(lock.read());
+        let second = pollster::block_on(lock.read());
+        let mut writer = pin!(lock.write());
+
+        assert!(poll_once(writer.as_mut()).is_pending());
+
+        drop(first);
+        assert!(poll_once(writer.as_mut()).is_pending());
+
+        drop(second);
+        assert!(poll_once(writer.as_mut()).is_ready());
+    }
+
+    #[test]
+    fn readers_are_blocked_while_a_writer_holds_the_lock() {
+        let lock = RwLock::new(0);
+        let writer = pollster::block_on(lock.write());
+        let mut reader = pin!(lock.read());
+        let mut rc_reader = pin!(lock.read_rc());
+
+        assert!(poll_once(reader.as_mut()).is_pending());
+        assert!(poll_once(rc_reader.as_mut()).is_pending());
+
+        drop(writer);
+        assert!(poll_once(reader.as_mut()).is_ready());
+    }
+
+    #[test]
+    fn second_writer_waits_for_the_first() {
+        let lock = RwLock::new(0);
+        let writer = pollster::block_on(lock.write());
+        let mut second = pin!(lock.write());
+        let mut second_rc = pin!(lock.write_rc());
+
+        assert!(poll_once(second.as_mut()).is_pending());
+        assert!(poll_once(second_rc.as_mut()).is_pending());
+
+        drop(writer);
+        assert!(poll_once(second.as_mut()).is_ready());
+    }
+
+    #[test]
+    fn writes_are_visible_to_later_readers() {
+        let lock = RwLock::new(alloc::vec![1]);
+        {
+            let mut guard = pollster::block_on(lock.write());
+            guard.push(2);
+        }
+        {
+            let mut guard = pollster::block_on(lock.write_rc());
+            guard.push(3);
+        }
+
+        assert_eq!(*pollster::block_on(lock.read()), [1, 2, 3]);
+        assert_eq!(*pollster::block_on(lock.read_rc()), [1, 2, 3]);
+    }
+
+    #[test]
+    fn rc_reader_blocks_writers_until_dropped() {
+        let lock = RwLock::new(1);
+        let reader = pollster::block_on(lock.read_rc());
+        assert_eq!(*reader, 1);
+
+        let mut writer = pin!(lock.write());
+        assert!(poll_once(writer.as_mut()).is_pending());
+        drop(reader);
+        assert!(poll_once(writer.as_mut()).is_ready());
+    }
+
+    /// `read_rc()` readers must share the lock like `read()` readers do.
+    #[test]
+    fn rc_readers_can_be_held_concurrently() {
+        let lock = RwLock::new(1);
+        let first = pollster::block_on(lock.read_rc());
+
+        let mut second = pin!(lock.read_rc());
+        assert!(
+            poll_once(second.as_mut()).is_ready(),
+            "a second shared reader must not be blocked by the first"
+        );
+        drop(first);
+    }
+
+    /// Readers obtained via `read()` and `read_rc()` should be able to coexist.
+    #[test]
+    fn rc_and_borrowed_readers_can_be_held_concurrently() {
+        let lock = RwLock::new(1);
+        let borrowed = pollster::block_on(lock.read());
+
+        let mut rc = pin!(lock.read_rc());
+        assert!(poll_once(rc.as_mut()).is_ready());
+        drop(borrowed);
+    }
+
+    #[test]
+    fn rc_guards_outlive_the_lock_handle() {
+        let lock = RwLock::new(7);
+        let reader = pollster::block_on(lock.read_rc());
+        drop(lock);
+
+        assert_eq!(*reader, 7);
+    }
+
+    #[test]
+    fn dropping_pending_futures_releases_nothing_and_blocks_nobody() {
+        let lock = RwLock::new(0);
+        let writer = pollster::block_on(lock.write());
+
+        {
+            let mut reader = pin!(lock.read());
+            assert!(poll_once(reader.as_mut()).is_pending());
+            let mut other_writer = pin!(lock.write());
+            assert!(poll_once(other_writer.as_mut()).is_pending());
+        }
+
+        drop(writer);
+        assert!(poll_once(pin!(lock.write()).as_mut()).is_ready());
+    }
+
+    #[test]
+    fn waiting_reader_is_woken_when_writer_releases() {
+        let lock = RwLock::new(0);
+        let writer = pollster::block_on(lock.write());
+        let (waker, wakes) = counting_waker();
+        let mut reader = pin!(lock.read_rc());
+
+        assert!(poll_with(reader.as_mut(), &waker).is_pending());
+        drop(writer);
+
+        assert!(wakes.count() >= 1);
+        assert!(poll_with(reader.as_mut(), &waker).is_ready());
     }
 }

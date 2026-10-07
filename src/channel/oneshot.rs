@@ -203,3 +203,154 @@ mod tests {
         assert_eq!(pollster::block_on(&mut receiver), Err(ChannelError));
     }
 }
+
+#[cfg(test)]
+mod behavior_tests {
+    use super::*;
+    use crate::test_util::{counting_waker, poll_once, poll_with};
+    use alloc::rc::Rc;
+    use core::{pin::pin, task::Poll};
+
+    #[test]
+    fn value_can_be_awaited_after_sending() {
+        let (sender, receiver) = channel();
+        sender.send(5).unwrap();
+
+        assert_eq!(pollster::block_on(receiver), Ok(5));
+    }
+
+    #[test]
+    fn awaiting_after_the_sender_was_dropped_fails() {
+        let (sender, receiver) = channel::<u8>();
+        drop(sender);
+
+        assert_eq!(pollster::block_on(receiver), Err(ChannelError));
+    }
+
+    #[test]
+    fn receiver_is_woken_by_send() {
+        let (sender, receiver) = channel();
+        let (waker, wakes) = counting_waker();
+        let mut receiver = pin!(receiver);
+
+        assert!(poll_with(receiver.as_mut(), &waker).is_pending());
+        assert_eq!(wakes.count(), 0);
+
+        sender.send("hello").unwrap();
+
+        assert_eq!(wakes.count(), 1);
+        assert_eq!(poll_with(receiver.as_mut(), &waker), Poll::Ready(Ok("hello")));
+    }
+
+    #[test]
+    fn receiver_is_woken_when_sender_is_dropped() {
+        let (sender, receiver) = channel::<u8>();
+        let (waker, wakes) = counting_waker();
+        let mut receiver = pin!(receiver);
+
+        assert!(poll_with(receiver.as_mut(), &waker).is_pending());
+        drop(sender);
+
+        assert_eq!(wakes.count(), 1);
+        assert_eq!(
+            poll_with(receiver.as_mut(), &waker),
+            Poll::Ready(Err(ChannelError))
+        );
+    }
+
+    #[test]
+    fn try_recv_is_none_before_anything_is_sent() {
+        let (_sender, mut receiver) = channel::<u8>();
+        assert_eq!(receiver.try_recv(), Ok(None));
+        assert_eq!(receiver.try_recv(), Ok(None));
+    }
+
+    #[test]
+    fn try_recv_returns_the_value_once() {
+        let (sender, mut receiver) = channel();
+        sender.send(3).unwrap();
+
+        assert_eq!(receiver.try_recv(), Ok(Some(3)));
+        // The channel is back to "empty" after the value has been taken.
+        assert_eq!(receiver.try_recv(), Ok(None));
+    }
+
+    #[test]
+    fn try_recv_errors_after_sender_drop() {
+        let (sender, mut receiver) = channel::<u8>();
+        drop(sender);
+
+        assert_eq!(receiver.try_recv(), Err(ChannelError));
+    }
+
+    #[test]
+    fn try_recv_still_returns_a_value_sent_before_the_sender_dropped() {
+        let (sender, mut receiver) = channel();
+        sender.send(1).unwrap();
+
+        assert_eq!(receiver.try_recv(), Ok(Some(1)));
+    }
+
+    #[test]
+    fn closing_the_receiver_makes_send_fail() {
+        let (sender, mut receiver) = channel();
+        receiver.close();
+
+        assert_eq!(sender.send(1), Err(ChannelError));
+    }
+
+    #[test]
+    fn closing_the_receiver_makes_try_recv_fail() {
+        let (_sender, mut receiver) = channel::<u8>();
+        receiver.close();
+
+        assert_eq!(receiver.try_recv(), Err(ChannelError));
+    }
+
+    #[test]
+    fn closing_twice_is_harmless() {
+        let (sender, mut receiver) = channel::<u8>();
+        receiver.close();
+        receiver.close();
+
+        assert_eq!(sender.send(1), Err(ChannelError));
+    }
+
+    #[test]
+    fn closing_after_a_value_was_sent_keeps_the_value() {
+        let (sender, mut receiver) = channel();
+        sender.send(8).unwrap();
+        receiver.close();
+
+        assert_eq!(receiver.try_recv(), Ok(Some(8)));
+    }
+
+    #[test]
+    fn value_is_dropped_when_unreceived_receiver_is_dropped() {
+        let tracker = Rc::new(());
+        let (sender, receiver) = channel();
+        sender.send(Rc::clone(&tracker)).unwrap();
+        assert_eq!(Rc::strong_count(&tracker), 2);
+
+        drop(receiver);
+
+        // The sent-but-unreceived value is released together with the channel.
+        assert_eq!(Rc::strong_count(&tracker), 1);
+    }
+
+    #[test]
+    fn dropping_an_unsent_sender_does_not_panic_and_pending_receiver_can_be_dropped() {
+        let (sender, receiver) = channel::<u8>();
+        let mut receiver = pin!(receiver);
+        assert!(poll_once(receiver.as_mut()).is_pending());
+        drop(sender);
+    }
+
+    #[test]
+    fn supports_non_copy_payloads() {
+        let (sender, receiver) = channel();
+        sender.send(alloc::vec![1, 2, 3]).unwrap();
+
+        assert_eq!(pollster::block_on(receiver), Ok(alloc::vec![1, 2, 3]));
+    }
+}

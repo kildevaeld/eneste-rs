@@ -13,3 +13,26 @@ impl fmt::Display for ChannelError {
 }
 
 impl core::error::Error for ChannelError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::{format, string::ToString};
+
+    #[test]
+    fn display_says_channel_closed() {
+        assert_eq!(ChannelError.to_string(), "channel closed");
+    }
+
+    #[test]
+    fn debug_and_equality() {
+        assert_eq!(format!("{ChannelError:?}"), "ChannelError");
+        assert_eq!(ChannelError, ChannelError);
+    }
+
+    #[test]
+    fn implements_error_trait() {
+        fn assert_error<E: core::error::Error>(_: &E) {}
+        assert_error(&ChannelError);
+    }
+}

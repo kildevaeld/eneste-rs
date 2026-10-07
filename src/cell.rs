@@ -91,35 +91,13 @@ impl<T> Upgrade for WeakObservableCell<T> {
     }
 }
 
-// impl<T> Clone for WeakObservableCell<T> {
-//     fn clone(&self) -> Self {
-//         Self(self.0.clone())
-//     }
-// }
+impl<T> Downgrade for WeakObservableCell<T> {
+    type Target = WeakObservableCell<T>;
 
-// impl<T> Upgrade for WeakObservableCell<T> {
-//     type Target = ObservableCell<T>;
-
-//     fn upgrade(&self) -> Option<Self::Target> {
-//         self.0.upgrade().map(ObservableCell)
-//     }
-// }
-
-// impl<T> Downgrade for ObservableCell<T> {
-//     type Target = WeakObservableCell<T>;
-
-//     fn downgrade(&self) -> Self::Target {
-//         WeakObservableCell(Rc::downgrade(&self.0))
-//     }
-// }
-
-// impl<T> Downgrade for WeakObservableCell<T> {
-//     type Target = WeakObservableCell<T>;
-
-//     fn downgrade(&self) -> Self::Target {
-//         WeakObservableCell(self.0.clone())
-//     }
-// }
+    fn downgrade(&self) -> Self::Target {
+        WeakObservableCell(self.0.clone())
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -247,5 +225,120 @@ mod tests {
             poll_next_once(Pin::new(&mut stream)),
             Poll::Pending
         ));
+    }
+}
+
+#[cfg(test)]
+mod behavior_tests {
+    use super::*;
+    use crate::test_util::{counting_waker, poll_next_once, poll_next_with};
+    use alloc::format;
+    use core::{pin::Pin, task::Poll};
+
+    #[test]
+    fn clone_copies_the_value_but_is_independent() {
+        let mut original = ObservableCell::new(1);
+        let mut copy = original.clone();
+
+        copy.set(2);
+        assert_eq!(original.get(), 1);
+        assert_eq!(copy.get(), 2);
+
+        original.set(3);
+        assert_eq!(copy.get(), 2);
+    }
+
+    #[test]
+    fn clone_does_not_share_subscribers() {
+        let original = ObservableCell::new(1);
+        let mut copy = original.clone();
+        let mut original_stream = original.subscribe();
+        let mut copy_stream = copy.subscribe();
+        let _ = poll_next_once(Pin::new(&mut original_stream));
+        let _ = poll_next_once(Pin::new(&mut copy_stream));
+
+        copy.set(2);
+
+        assert_eq!(
+            poll_next_once(Pin::new(&mut copy_stream)),
+            Poll::Ready(Some(()))
+        );
+        assert!(poll_next_once(Pin::new(&mut original_stream)).is_pending());
+    }
+
+    #[test]
+    fn change_wakes_waiting_subscriber() {
+        let mut cell = ObservableCell::new(false);
+        let mut stream = cell.subscribe();
+        let (waker, wakes) = counting_waker();
+
+        assert!(poll_next_with(Pin::new(&mut stream), &waker).is_pending());
+        cell.set(true);
+
+        assert_eq!(wakes.count(), 1);
+    }
+
+    #[test]
+    fn works_with_non_integer_copy_types() {
+        let mut cell = ObservableCell::new('a');
+        cell.set('b');
+        assert_eq!(cell.get(), 'b');
+
+        let mut cell = ObservableCell::new((1u8, true));
+        cell.set((2, false));
+        assert_eq!(cell.get(), (2, false));
+    }
+
+    #[test]
+    fn equality_compares_current_values() {
+        let a = ObservableCell::new(1);
+        let mut b = ObservableCell::new(1);
+        assert!(a == b);
+
+        b.set(2);
+        assert!(a != b);
+    }
+
+    #[test]
+    fn debug_shows_the_value() {
+        let cell = ObservableCell::new(7);
+        let output = format!("{cell:?}");
+        assert!(output.contains("value: 7"), "unexpected output: {output}");
+    }
+
+    #[test]
+    fn weak_upgrade_shares_state_with_the_original() {
+        let mut cell = ObservableCell::new(1);
+        let weak = cell.downgrade();
+
+        let mut strong = weak.upgrade().expect("cell is alive");
+        strong.set(5);
+        assert_eq!(cell.get(), 5);
+
+        cell.set(6);
+        assert_eq!(strong.get(), 6);
+    }
+
+    #[test]
+    fn weak_upgrade_shares_subscribers() {
+        let cell = ObservableCell::new(1);
+        let weak = cell.downgrade();
+        let mut stream = cell.subscribe();
+        let _ = poll_next_once(Pin::new(&mut stream));
+
+        weak.upgrade().unwrap().set(2);
+
+        assert_eq!(poll_next_once(Pin::new(&mut stream)), Poll::Ready(Some(())));
+    }
+
+    #[test]
+    fn weak_fails_to_upgrade_after_the_cell_is_dropped() {
+        let cell = ObservableCell::new(1);
+        let weak = cell.downgrade();
+        let weak_clone = weak.clone();
+        drop(cell);
+
+        assert!(weak.upgrade().is_none());
+        assert!(weak_clone.upgrade().is_none());
     }
 }

@@ -2,7 +2,6 @@ use core::{
     cell::{Cell, RefCell},
     pin::Pin,
     task::{Context, RawWaker, RawWakerVTable, Waker},
-    usize,
 };
 
 use alloc::{
@@ -11,7 +10,7 @@ use alloc::{
     vec::Vec,
 };
 
-use crate::spawner::{SpawnTask, Spawner};
+use goerdet::{LocalSpawner, Task};
 
 /// A trait for waking up the event loop when a task is scheduled.
 pub trait EventLoopWaker {
@@ -84,14 +83,14 @@ where
     }
 }
 
-impl<'a, T> Spawner<'a> for Executor<'a, T>
+impl<'a, T> LocalSpawner<'a> for Executor<'a, T>
 where
     T: EventLoopWaker,
 {
     type Task = ExcutorTask<'a, T>;
-    fn spawn<'b: 'a, F>(&self, task: F) -> Self::Task
+    fn spawn<F>(&self, task: F) -> Self::Task
     where
-        F: Future<Output = ()> + 'b,
+        F: Future<Output = ()> + 'a,
     {
         // Each spawned future lives in a task cell so its waker can requeue it later.
         let task = Rc::new(TaskCell {
@@ -301,7 +300,7 @@ where
     task: Option<Rc<TaskCell<'a, T>>>,
 }
 
-impl<'a, T> SpawnTask for ExcutorTask<'a, T>
+impl<'a, T> Task for ExcutorTask<'a, T>
 where
     T: EventLoopWaker,
 {

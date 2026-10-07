@@ -191,3 +191,183 @@ impl<T> Future for RcLockFuture<T> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_util::{counting_waker, poll_once, poll_with};
+    use core::pin::pin;
+
+    #[test]
+    fn lock_succeeds_without_contention() {
+        let mutex = AsyncMutex::new(5);
+        let mut fut = pin!(mutex.lock());
+
+        let Poll::Ready(guard) = poll_once(fut.as_mut()) else {
+            panic!("uncontended lock should be ready immediately");
+        };
+        assert_eq!(*guard, 5);
+    }
+
+    #[test]
+    fn guard_allows_mutation_that_persists() {
+        let mutex = AsyncMutex::new(1);
+        {
+            let mut guard = pollster::block_on(mutex.lock());
+            *guard += 41;
+        }
+        assert_eq!(*pollster::block_on(mutex.lock()), 42);
+    }
+
+    #[test]
+    fn lock_is_pending_while_guard_is_alive() {
+        let mutex = AsyncMutex::new(0);
+        let guard = pollster::block_on(mutex.lock());
+
+        let mut second = pin!(mutex.lock());
+        assert!(poll_once(second.as_mut()).is_pending());
+
+        drop(guard);
+    }
+
+    #[test]
+    fn lock_becomes_ready_and_wakes_after_guard_is_dropped() {
+        let mutex = AsyncMutex::new(0);
+        let guard = pollster::block_on(mutex.lock());
+        let (waker, wakes) = counting_waker();
+
+        let mut second = pin!(mutex.lock());
+        assert!(poll_with(second.as_mut(), &waker).is_pending());
+        assert_eq!(wakes.count(), 0);
+
+        drop(guard);
+        assert!(wakes.count() >= 1);
+
+        let Poll::Ready(guard) = poll_with(second.as_mut(), &waker) else {
+            panic!("lock should be available after the guard was dropped");
+        };
+        assert_eq!(*guard, 0);
+    }
+
+    #[test]
+    fn lock_can_be_reacquired_repeatedly() {
+        let mutex = AsyncMutex::new(0u32);
+        for i in 1..=10 {
+            let mut guard = pollster::block_on(mutex.lock());
+            *guard = i;
+        }
+        assert_eq!(*pollster::block_on(mutex.lock()), 10);
+    }
+
+    #[test]
+    fn dropping_a_pending_lock_future_does_not_hold_the_lock() {
+        let mutex = AsyncMutex::new(0);
+        let guard = pollster::block_on(mutex.lock());
+
+        {
+            let mut waiting = pin!(mutex.lock());
+            assert!(poll_once(waiting.as_mut()).is_pending());
+        }
+
+        drop(guard);
+        let _again = pollster::block_on(mutex.lock());
+    }
+
+    #[test]
+    fn dropping_a_never_polled_lock_future_is_harmless() {
+        let mutex = AsyncMutex::new(0);
+        drop(mutex.lock());
+        let _guard = pollster::block_on(mutex.lock());
+    }
+
+    #[test]
+    fn guard_provides_exclusive_access_to_non_copy_values() {
+        let mutex = AsyncMutex::new(alloc::vec![1, 2, 3]);
+        {
+            let mut guard = pollster::block_on(mutex.lock());
+            guard.push(4);
+        }
+        assert_eq!(pollster::block_on(mutex.lock()).len(), 4);
+    }
+
+    #[test]
+    fn rc_lock_succeeds_without_contention() {
+        let mutex = AsyncMutex::new(7);
+        let guard = pollster::block_on(mutex.lock_rc());
+        assert_eq!(*guard, 7);
+    }
+
+    #[test]
+    fn rc_guard_allows_mutation_that_persists() {
+        let mutex = AsyncMutex::new(alloc::string::String::from("a"));
+        {
+            let mut guard = pollster::block_on(mutex.lock_rc());
+            guard.push('b');
+        }
+        assert_eq!(&**pollster::block_on(mutex.lock_rc()), "ab");
+    }
+
+    #[test]
+    fn rc_lock_is_pending_while_locked_and_ready_after_release() {
+        let mutex = AsyncMutex::new(0);
+        let guard = pollster::block_on(mutex.lock_rc());
+        let (waker, wakes) = counting_waker();
+
+        let mut second = pin!(mutex.lock_rc());
+        assert!(poll_with(second.as_mut(), &waker).is_pending());
+
+        drop(guard);
+        assert!(wakes.count() >= 1);
+        assert!(poll_with(second.as_mut(), &waker).is_ready());
+    }
+
+    #[test]
+    fn rc_and_borrowed_locks_exclude_each_other() {
+        let mutex = AsyncMutex::new(0);
+
+        let rc_guard = pollster::block_on(mutex.lock_rc());
+        let mut borrowed = pin!(mutex.lock());
+        assert!(poll_once(borrowed.as_mut()).is_pending());
+        drop(rc_guard);
+        let borrowed_guard = poll_once(borrowed.as_mut());
+        assert!(borrowed_guard.is_ready());
+
+        let mut rc = pin!(mutex.lock_rc());
+        assert!(poll_once(rc.as_mut()).is_pending());
+    }
+
+    #[test]
+    fn rc_guard_keeps_the_mutex_state_alive_after_the_mutex_is_dropped() {
+        let mutex = AsyncMutex::new(3);
+        let guard = pollster::block_on(mutex.lock_rc());
+        drop(mutex);
+
+        assert_eq!(*guard, 3);
+    }
+
+    /// With several contenders, every waiter should acquire the lock as each
+    /// previous holder releases it. Regression test for the `Event::notified`
+    /// accounting bug, which used to swallow wake-ups for later waiters.
+    #[test]
+    fn waiters_acquire_the_lock_in_turn() {
+        let mutex = AsyncMutex::new(0);
+        let (waker, wakes) = counting_waker();
+
+        let first = pollster::block_on(mutex.lock());
+        let mut second = pin!(mutex.lock());
+        let mut third = pin!(mutex.lock());
+        assert!(poll_with(second.as_mut(), &waker).is_pending());
+        assert!(poll_with(third.as_mut(), &waker).is_pending());
+
+        drop(first);
+        let Poll::Ready(second_guard) = poll_with(second.as_mut(), &waker) else {
+            panic!("second waiter should acquire the lock first");
+        };
+        assert!(poll_with(third.as_mut(), &waker).is_pending());
+
+        let wakes_before = wakes.count();
+        drop(second_guard);
+        assert!(wakes.count() > wakes_before, "third waiter must be woken");
+        assert!(poll_with(third.as_mut(), &waker).is_ready());
+    }
+}

@@ -22,5 +22,8 @@ pub mod poll_lock;
 pub mod spawner;
 mod upgrade;
 
+#[cfg(test)]
+mod test_util;
+
 pub use self::atom::{Atom, WeakAtom};
 pub use self::upgrade::{Downgrade, Upgrade};

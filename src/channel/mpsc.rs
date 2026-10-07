@@ -497,3 +497,245 @@ mod tests {
         assert_eq!(sender.try_send(4), Err(4));
     }
 }
+
+#[cfg(test)]
+mod behavior_tests {
+    use super::*;
+    use crate::test_util::{counting_waker, poll_next_once, poll_next_with, poll_once, poll_with};
+    use alloc::{rc::Rc, vec::Vec};
+    use core::pin::pin;
+
+    fn drain<T>(receiver: &mut Receiver<T>) -> Vec<T> {
+        let mut items = Vec::new();
+        while let Poll::Ready(Some(item)) = poll_next_once(Pin::new(&mut *receiver)) {
+            items.push(item);
+        }
+        items
+    }
+
+    #[test]
+    fn items_are_received_in_fifo_order() {
+        let (sender, mut receiver) = channel(10);
+        for i in 0..5 {
+            sender.try_send(i).unwrap();
+        }
+
+        assert_eq!(drain(&mut receiver), [0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn try_send_returns_the_value_when_the_queue_is_full() {
+        let (sender, mut receiver) = channel(2);
+
+        assert_eq!(sender.try_send(1), Ok(()));
+        assert_eq!(sender.try_send(2), Ok(()));
+        assert_eq!(sender.try_send(3), Err(3));
+
+        assert_eq!(poll_next_once(Pin::new(&mut receiver)), Poll::Ready(Some(1)));
+        assert_eq!(sender.try_send(3), Ok(()));
+        assert_eq!(drain(&mut receiver), [2, 3]);
+    }
+
+    #[test]
+    fn zero_capacity_channel_rejects_try_send() {
+        let (sender, receiver) = channel(0);
+
+        assert!(receiver.is_full());
+        assert!(receiver.is_empty());
+        assert_eq!(sender.try_send(1), Err(1));
+    }
+
+    #[test]
+    fn send_completes_immediately_when_there_is_capacity() {
+        let (sender, mut receiver) = channel(1);
+        let mut send = pin!(sender.send(9));
+
+        assert_eq!(poll_once(send.as_mut()), Poll::Ready(Ok(())));
+        assert_eq!(poll_next_once(Pin::new(&mut receiver)), Poll::Ready(Some(9)));
+    }
+
+    #[test]
+    fn send_is_pending_while_full_and_completes_after_a_receive() {
+        let (sender, mut receiver) = channel(1);
+        let (waker, wakes) = counting_waker();
+        sender.try_send(1).unwrap();
+
+        let mut send = pin!(sender.send(2));
+        assert!(poll_with(send.as_mut(), &waker).is_pending());
+        assert_eq!(wakes.count(), 0);
+
+        assert_eq!(poll_next_once(Pin::new(&mut receiver)), Poll::Ready(Some(1)));
+        assert_eq!(wakes.count(), 1);
+
+        assert_eq!(poll_with(send.as_mut(), &waker), Poll::Ready(Ok(())));
+        assert_eq!(poll_next_once(Pin::new(&mut receiver)), Poll::Ready(Some(2)));
+    }
+
+    #[test]
+    fn dropping_a_pending_send_does_not_enqueue_its_value() {
+        let (sender, mut receiver) = channel(1);
+        sender.try_send(1).unwrap();
+
+        {
+            let mut send = pin!(sender.send(2));
+            assert!(poll_once(send.as_mut()).is_pending());
+        }
+
+        assert_eq!(drain(&mut receiver), [1]);
+    }
+
+    #[test]
+    fn send_fails_once_the_receiver_is_gone() {
+        let (sender, receiver) = channel::<u8>(1);
+        drop(receiver);
+
+        let mut send = pin!(sender.send(1));
+        assert_eq!(poll_once(send.as_mut()), Poll::Ready(Err(ChannelError)));
+    }
+
+    #[test]
+    fn try_send_hands_the_value_back_once_the_receiver_is_gone() {
+        let (sender, receiver) = channel(1);
+        drop(receiver);
+
+        assert!(sender.is_closed());
+        assert_eq!(sender.try_send("value"), Err("value"));
+    }
+
+    #[test]
+    fn receiver_is_pending_on_an_empty_channel_with_live_senders() {
+        let (sender, mut receiver) = channel::<u8>(1);
+
+        assert!(poll_next_once(Pin::new(&mut receiver)).is_pending());
+        drop(sender);
+    }
+
+    #[test]
+    fn receiver_ends_immediately_when_all_senders_are_dropped_and_queue_is_empty() {
+        let (sender, mut receiver) = channel::<u8>(1);
+        drop(sender);
+
+        assert!(receiver.is_closed());
+        assert_eq!(poll_next_once(Pin::new(&mut receiver)), Poll::Ready(None));
+    }
+
+    #[test]
+    fn receiver_drains_queued_items_before_reporting_the_end() {
+        let (sender, mut receiver) = channel(3);
+        sender.try_send(1).unwrap();
+        sender.try_send(2).unwrap();
+        drop(sender);
+
+        assert_eq!(poll_next_once(Pin::new(&mut receiver)), Poll::Ready(Some(1)));
+        assert_eq!(poll_next_once(Pin::new(&mut receiver)), Poll::Ready(Some(2)));
+        assert_eq!(poll_next_once(Pin::new(&mut receiver)), Poll::Ready(None));
+    }
+
+    #[test]
+    fn cloned_senders_feed_the_same_receiver() {
+        let (sender, mut receiver) = channel(4);
+        let other = sender.clone();
+
+        sender.try_send("a").unwrap();
+        other.try_send("b").unwrap();
+
+        assert_eq!(drain(&mut receiver), ["a", "b"]);
+    }
+
+    #[test]
+    fn channel_stays_open_until_the_last_sender_clone_is_dropped() {
+        let (sender, receiver) = channel::<u8>(1);
+        let other = sender.clone();
+
+        assert!(!sender.is_closed());
+        drop(sender);
+        assert!(!receiver.is_closed());
+        assert!(!other.is_closed());
+        drop(other);
+        assert!(receiver.is_closed());
+    }
+
+    #[test]
+    fn receiver_is_woken_when_the_last_sender_is_dropped() {
+        let (sender, mut receiver) = channel::<u8>(1);
+        let (waker, wakes) = counting_waker();
+
+        assert!(poll_next_with(Pin::new(&mut receiver), &waker).is_pending());
+        drop(sender);
+
+        assert_eq!(wakes.count(), 1);
+        assert_eq!(
+            poll_next_with(Pin::new(&mut receiver), &waker),
+            Poll::Ready(None)
+        );
+    }
+
+    #[test]
+    fn send_futures_from_a_sender_clone_outlive_the_original_sender() {
+        let (sender, mut receiver) = channel(1);
+        let other = sender.clone();
+        drop(sender);
+
+        let mut send = pin!(other.send(5));
+        assert_eq!(poll_once(send.as_mut()), Poll::Ready(Ok(())));
+        assert_eq!(poll_next_once(Pin::new(&mut receiver)), Poll::Ready(Some(5)));
+    }
+
+    #[test]
+    fn queued_values_are_dropped_with_the_receiver() {
+        let tracker = Rc::new(());
+        let (sender, receiver) = channel(2);
+        sender.try_send(Rc::clone(&tracker)).unwrap();
+        sender.try_send(Rc::clone(&tracker)).unwrap();
+        assert_eq!(Rc::strong_count(&tracker), 3);
+
+        drop(receiver);
+
+        assert_eq!(Rc::strong_count(&tracker), 1);
+        drop(sender);
+    }
+
+    #[test]
+    fn receiver_wakes_for_a_second_item_after_consuming_the_first() {
+        let (sender, mut receiver) = channel(2);
+        let (waker, wakes) = counting_waker();
+
+        assert!(poll_next_with(Pin::new(&mut receiver), &waker).is_pending());
+        sender.try_send(1).unwrap();
+        assert_eq!(wakes.count(), 1);
+        assert_eq!(
+            poll_next_with(Pin::new(&mut receiver), &waker),
+            Poll::Ready(Some(1))
+        );
+
+        assert!(poll_next_with(Pin::new(&mut receiver), &waker).is_pending());
+        sender.try_send(2).unwrap();
+        assert_eq!(wakes.count(), 2, "receiver must be woken for the second item");
+        assert_eq!(
+            poll_next_with(Pin::new(&mut receiver), &waker),
+            Poll::Ready(Some(2))
+        );
+    }
+
+    #[test]
+    fn blocked_senders_proceed_one_at_a_time() {
+        let (sender, mut receiver) = channel(1);
+        let (waker, wakes) = counting_waker();
+        sender.try_send(0).unwrap();
+
+        let mut first = pin!(sender.send(1));
+        let mut second = pin!(sender.send(2));
+        assert!(poll_with(first.as_mut(), &waker).is_pending());
+        assert!(poll_with(second.as_mut(), &waker).is_pending());
+
+        assert_eq!(poll_next_once(Pin::new(&mut receiver)), Poll::Ready(Some(0)));
+        assert_eq!(poll_with(first.as_mut(), &waker), Poll::Ready(Ok(())));
+        assert!(poll_with(second.as_mut(), &waker).is_pending());
+
+        let before = wakes.count();
+        assert_eq!(poll_next_once(Pin::new(&mut receiver)), Poll::Ready(Some(1)));
+        assert!(wakes.count() > before, "second sender must be woken");
+        assert_eq!(poll_with(second.as_mut(), &waker), Poll::Ready(Ok(())));
+        assert_eq!(poll_next_once(Pin::new(&mut receiver)), Poll::Ready(Some(2)));
+    }
+}

@@ -36,6 +36,7 @@ impl<T> Event<T> {
                 listeners: BTreeMap::new(),
                 next_id: 0,
                 notified: 0,
+                closed: false,
                 value: PhantomData,
             })),
         }
@@ -69,7 +70,7 @@ impl<T> Event<T> {
     /// # Examples
     ///
     /// ```ignore
-    /// use lamp_runtime::event::Event;
+    /// use eneste::event::Event;
     ///
     /// let event = Event::new();
     ///
@@ -115,7 +116,7 @@ impl<T> Event<T> {
     /// # Examples
     ///
     /// ```ignore
-    /// use lamp_runtime::event::{Event, NotificationExt};
+    /// use eneste::event::{Event, NotificationExt};
     ///
     /// let event = Event::new();
     /// event.notify(2usize.additional());
@@ -164,6 +165,7 @@ impl<T> Event<T> {
 impl<T> Drop for Event<T> {
     fn drop(&mut self) {
         let mut inner = self.inner.borrow_mut();
+        inner.closed = true;
         for entry in inner.listeners.values_mut() {
             if let Some(waker) = entry.waker.take() {
                 waker.wake();
@@ -182,6 +184,9 @@ struct Inner<T> {
 
     /// Number of notified listeners that haven't been woken yet.
     notified: usize,
+
+    /// Set once the owning `Event` has been dropped.
+    closed: bool,
     value: PhantomData<fn(T)>,
 }
 
@@ -220,6 +225,11 @@ pub struct EventListener<T = ()> {
 }
 
 impl<T> EventListener<T> {
+    /// Whether the `Event` this listener belongs to has been dropped.
+    pub(crate) fn is_closed(&self) -> bool {
+        self.event.borrow().closed
+    }
+
     pub fn is_notified(&self) -> bool {
         self.event
             .borrow()
@@ -264,13 +274,18 @@ impl<T> core::future::Future for EventListener<T> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut inner = self.event.borrow_mut();
+        let inner = &mut *inner;
 
         let Some(entry) = inner.listeners.get_mut(&self.id) else {
             unreachable!("Entry shouldn't be removed")
         };
 
-        if entry.is_notified() {
-            return Poll::Ready(entry.value.take().unwrap());
+        if let Some(value) = entry.value.take() {
+            // The notification has been consumed, so it must no longer count
+            // towards `notified`. Otherwise later `notify(n)` calls would
+            // believe that `n` listeners were already notified and get lost.
+            inner.notified = inner.notified.saturating_sub(1);
+            return Poll::Ready(value);
         }
 
         // Store the waker for later notification
@@ -320,12 +335,18 @@ impl<T> Stream for EventStream<T> {
             let mut this = self.as_mut().project();
 
             match this.state.as_mut().project() {
-                EventStreamProj::Listening { listener } => match listener.poll(cx) {
+                EventStreamProj::Listening { mut listener } => match listener.as_mut().poll(cx) {
                     Poll::Ready(data) => {
                         *this.state = EventStreamState::Next;
                         return Poll::Ready(Some(data));
                     }
-                    Poll::Pending => return Poll::Pending,
+                    Poll::Pending => {
+                        if listener.is_closed() {
+                            *this.state = EventStreamState::Done;
+                            continue;
+                        }
+                        return Poll::Pending;
+                    }
                 },
                 EventStreamProj::Next => {
                     let Some(event) = this.listener.upgrade() else {
@@ -568,5 +589,411 @@ mod tests {
         assert!(!third.is_notified());
         assert_eq!(pollster::block_on(&mut second), ());
         assert!(matches!(poll_once(Pin::new(&mut third)), Poll::Pending));
+    }
+
+    // ---- additional coverage ----
+
+    use crate::test_util::{counting_waker, poll_next_once, poll_with};
+    use alloc::vec::Vec;
+
+    #[test]
+    fn default_event_is_usable() {
+        let event = Event::default();
+        let listener = event.listen();
+        event.notify(1);
+        assert!(listener.is_notified());
+    }
+
+    #[test]
+    fn notify_without_listeners_is_a_noop() {
+        let event = Event::new();
+        event.notify(1);
+        event.notify(usize::MAX);
+        event.notify(3.additional());
+
+        // Listeners created afterwards are not retroactively notified.
+        let listener = event.listen();
+        assert!(!listener.is_notified());
+    }
+
+    #[test]
+    fn notify_zero_notifies_nobody() {
+        let event = Event::new();
+        let listener = event.listen();
+
+        event.notify(0);
+
+        assert!(!listener.is_notified());
+    }
+
+    #[test]
+    fn notify_n_notifies_exactly_n_listeners_in_registration_order() {
+        let event = Event::new();
+        let listeners: Vec<_> = (0..5).map(|_| event.listen()).collect();
+
+        event.notify(3);
+
+        let notified: Vec<bool> = listeners.iter().map(|l| l.is_notified()).collect();
+        assert_eq!(notified, [true, true, true, false, false]);
+    }
+
+    #[test]
+    fn notify_more_than_listener_count_notifies_everyone() {
+        let event = Event::new();
+        let first = event.listen();
+        let second = event.listen();
+
+        event.notify(10);
+
+        assert!(first.is_notified());
+        assert!(second.is_notified());
+    }
+
+    #[test]
+    fn notify_counts_already_notified_listeners_towards_the_total() {
+        let event = Event::new();
+        let first = event.listen();
+        let second = event.listen();
+
+        event.notify(1);
+        // "At least 2 notified": only one more is required.
+        event.notify(2);
+
+        assert!(first.is_notified());
+        assert!(second.is_notified());
+    }
+
+    #[test]
+    fn additional_notifications_stack_on_top_of_existing_ones() {
+        let event = Event::new();
+        let listeners: Vec<_> = (0..4).map(|_| event.listen()).collect();
+
+        event.notify(1);
+        event.notify(2.additional());
+
+        let notified: Vec<bool> = listeners.iter().map(|l| l.is_notified()).collect();
+        assert_eq!(notified, [true, true, true, false]);
+    }
+
+    #[test]
+    fn additional_max_notifies_every_waiting_listener() {
+        let event = Event::new();
+        let first = event.listen();
+        let second = event.listen();
+        let third = event.listen();
+
+        event.notify(1);
+        event.notify(usize::MAX.additional());
+
+        assert!(first.is_notified());
+        assert!(second.is_notified());
+        assert!(third.is_notified());
+    }
+
+    #[test]
+    fn listener_created_after_notify_is_not_notified() {
+        let event = Event::new();
+        let early = event.listen();
+        event.notify(usize::MAX);
+        let late = event.listen();
+
+        assert!(early.is_notified());
+        assert!(!late.is_notified());
+    }
+
+    #[test]
+    fn notify_wakes_the_registered_waker() {
+        let event = Event::new();
+        let mut listener = event.listen();
+        let (waker, wakes) = counting_waker();
+
+        assert_eq!(poll_with(Pin::new(&mut listener), &waker), Poll::Pending);
+        assert_eq!(wakes.count(), 0);
+
+        event.notify(1);
+
+        assert_eq!(wakes.count(), 1);
+        assert_eq!(poll_with(Pin::new(&mut listener), &waker), Poll::Ready(()));
+    }
+
+    #[test]
+    fn notify_only_wakes_selected_listeners() {
+        let event = Event::new();
+        let mut first = event.listen();
+        let mut second = event.listen();
+        let (first_waker, first_wakes) = counting_waker();
+        let (second_waker, second_wakes) = counting_waker();
+
+        let _ = poll_with(Pin::new(&mut first), &first_waker);
+        let _ = poll_with(Pin::new(&mut second), &second_waker);
+
+        event.notify(1);
+
+        assert_eq!(first_wakes.count(), 1);
+        assert_eq!(second_wakes.count(), 0);
+    }
+
+    #[test]
+    fn notify_all_wakes_every_waiting_listener_once() {
+        let event = Event::new();
+        let mut first = event.listen();
+        let mut second = event.listen();
+        let (first_waker, first_wakes) = counting_waker();
+        let (second_waker, second_wakes) = counting_waker();
+
+        let _ = poll_with(Pin::new(&mut first), &first_waker);
+        let _ = poll_with(Pin::new(&mut second), &second_waker);
+
+        event.notify(usize::MAX);
+        event.notify(usize::MAX);
+
+        assert_eq!(first_wakes.count(), 1);
+        assert_eq!(second_wakes.count(), 1);
+    }
+
+    #[test]
+    fn repolling_updates_the_stored_waker() {
+        let event = Event::new();
+        let mut listener = event.listen();
+        let (old_waker, old_wakes) = counting_waker();
+        let (new_waker, new_wakes) = counting_waker();
+
+        let _ = poll_with(Pin::new(&mut listener), &old_waker);
+        let _ = poll_with(Pin::new(&mut listener), &new_waker);
+
+        event.notify(1);
+
+        assert_eq!(old_wakes.count(), 0);
+        assert_eq!(new_wakes.count(), 1);
+    }
+
+    #[test]
+    fn polling_a_consumed_listener_is_pending_again() {
+        let event = Event::new();
+        let mut listener = event.listen();
+        event.notify(1);
+
+        assert_eq!(pollster::block_on(&mut listener), ());
+        assert!(matches!(poll_once(Pin::new(&mut listener)), Poll::Pending));
+    }
+
+    #[test]
+    fn dropping_an_unnotified_listener_does_not_affect_others() {
+        let event = Event::new();
+        let first = event.listen();
+        let second = event.listen();
+
+        drop(first);
+        event.notify(1);
+
+        assert!(second.is_notified());
+    }
+
+    #[test]
+    fn dropping_a_notified_listener_with_no_one_waiting_discards_the_notification() {
+        let event = Event::new();
+        let first = event.listen();
+        event.notify(1);
+        drop(first);
+
+        let second = event.listen();
+        assert!(!second.is_notified());
+
+        event.notify(1);
+        assert!(second.is_notified());
+    }
+
+    #[test]
+    fn dropping_a_notified_listener_wakes_the_listener_receiving_the_handoff() {
+        let event = Event::new();
+        let first = event.listen();
+        let mut second = event.listen();
+        let (waker, wakes) = counting_waker();
+
+        let _ = poll_with(Pin::new(&mut second), &waker);
+        event.notify(1);
+        assert_eq!(wakes.count(), 0);
+
+        drop(first);
+
+        assert_eq!(wakes.count(), 1);
+        assert_eq!(poll_with(Pin::new(&mut second), &waker), Poll::Ready(()));
+    }
+
+    #[test]
+    fn handed_off_notification_keeps_its_typed_value() {
+        let event = Event::<u32>::new_with();
+        let first = event.listen();
+        let mut second = event.listen();
+
+        event.notify(1.with(99));
+        drop(first);
+
+        assert_eq!(pollster::block_on(&mut second), 99);
+    }
+
+    #[test]
+    fn with_notification_clones_value_for_each_listener() {
+        let event = Event::<u32>::new_with();
+        let mut first = event.listen();
+        let mut second = event.listen();
+
+        event.notify(usize::MAX.with(7));
+
+        assert_eq!(pollster::block_on(&mut first), 7);
+        assert_eq!(pollster::block_on(&mut second), 7);
+    }
+
+    #[test]
+    fn additional_notification_can_carry_a_value() {
+        let event = Event::<&'static str>::new_with();
+        let mut first = event.listen();
+        let mut second = event.listen();
+
+        event.notify(1.with("one"));
+        event.notify(1.with("two").additional());
+
+        assert_eq!(pollster::block_on(&mut first), "one");
+        assert_eq!(pollster::block_on(&mut second), "two");
+    }
+
+    #[test]
+    fn notification_trait_accessors() {
+        assert_eq!(3usize.count(), 3);
+        assert!(!3usize.is_additional());
+        assert!(3usize.additional().is_additional());
+        assert_eq!(3usize.additional().count(), 3);
+
+        let with = 2usize.with("tag");
+        assert_eq!(with.count(), 2);
+        assert_eq!(with.tag(), "tag");
+        assert!(!with.is_additional());
+        assert!(with.additional().is_additional());
+    }
+
+    #[test]
+    fn dropping_the_event_wakes_pending_listeners() {
+        let event = Event::new();
+        let mut listener = event.listen();
+        let (waker, wakes) = counting_waker();
+
+        let _ = poll_with(Pin::new(&mut listener), &waker);
+        drop(event);
+
+        assert_eq!(wakes.count(), 1);
+    }
+
+    #[test]
+    fn listener_outlives_its_event_without_panicking() {
+        let event = Event::new();
+        let listener = event.listen();
+        drop(event);
+
+        assert!(!listener.is_notified());
+        drop(listener);
+    }
+
+    #[test]
+    fn stream_is_pending_until_notified_and_then_yields() {
+        let event = Event::new();
+        let mut stream = event.stream();
+
+        assert!(matches!(
+            poll_next_once(Pin::new(&mut stream)),
+            Poll::Pending
+        ));
+        event.notify(usize::MAX);
+        assert_eq!(poll_next_once(Pin::new(&mut stream)), Poll::Ready(Some(())));
+    }
+
+    #[test]
+    fn stream_resubscribes_after_each_item() {
+        let event = Event::new();
+        let mut stream = event.stream();
+
+        for _ in 0..3 {
+            event.notify(usize::MAX);
+            assert_eq!(poll_next_once(Pin::new(&mut stream)), Poll::Ready(Some(())));
+            assert!(matches!(
+                poll_next_once(Pin::new(&mut stream)),
+                Poll::Pending
+            ));
+        }
+    }
+
+    #[test]
+    fn stream_yields_typed_values() {
+        let event = Event::<u32>::new_with();
+        let mut stream = event.stream();
+
+        event.notify(usize::MAX.with(1));
+        assert_eq!(poll_next_once(Pin::new(&mut stream)), Poll::Ready(Some(1)));
+        assert!(matches!(
+            poll_next_once(Pin::new(&mut stream)),
+            Poll::Pending
+        ));
+        event.notify(usize::MAX.with(2));
+        assert_eq!(poll_next_once(Pin::new(&mut stream)), Poll::Ready(Some(2)));
+    }
+
+    #[test]
+    fn multiple_streams_each_receive_broadcasts() {
+        let event = Event::new();
+        let mut a = event.stream();
+        let mut b = event.stream();
+
+        event.notify(usize::MAX);
+
+        assert_eq!(poll_next_once(Pin::new(&mut a)), Poll::Ready(Some(())));
+        assert_eq!(poll_next_once(Pin::new(&mut b)), Poll::Ready(Some(())));
+    }
+
+    #[test]
+    fn stream_ends_once_the_event_is_dropped() {
+        let event = Event::new();
+        let mut stream = event.stream();
+
+        event.notify(usize::MAX);
+        assert_eq!(poll_next_once(Pin::new(&mut stream)), Poll::Ready(Some(())));
+
+        drop(event);
+        assert_eq!(poll_next_once(Pin::new(&mut stream)), Poll::Ready(None));
+        // The stream stays finished.
+        assert_eq!(poll_next_once(Pin::new(&mut stream)), Poll::Ready(None));
+    }
+
+    /// Dropping the event wakes parked listeners; a stream parked on it
+    /// must then terminate instead of staying pending forever.
+    #[test]
+    fn waiting_stream_ends_when_the_event_is_dropped() {
+        let event = Event::new();
+        let mut stream = event.stream();
+        assert!(matches!(
+            poll_next_once(Pin::new(&mut stream)),
+            Poll::Pending
+        ));
+
+        drop(event);
+
+        assert_eq!(poll_next_once(Pin::new(&mut stream)), Poll::Ready(None));
+    }
+
+    /// Regression test: consuming a notification must be subtracted from the
+    /// internal `notified` counter, otherwise later `notify(n)` calls silently
+    /// lose wake-ups (this used to hang `WaitGroup::wait`, `AsyncMutex`, mpsc
+    /// channels and friends under contention).
+    #[test]
+    fn notify_one_still_works_after_a_notification_was_consumed() {
+        let event = Event::new();
+
+        let mut first = event.listen();
+        event.notify(1);
+        assert_eq!(pollster::block_on(&mut first), ());
+        drop(first);
+
+        let second = event.listen();
+        event.notify(1);
+
+        assert!(second.is_notified());
     }
 }
