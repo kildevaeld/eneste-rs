@@ -1,4 +1,4 @@
-use goerdet::LocalSpawner;
+pub use goerdet::LocalSpawner;
 
 use crate::{Downgrade, Upgrade};
 
