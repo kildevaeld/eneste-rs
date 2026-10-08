@@ -70,16 +70,35 @@ where
         !self.state.tasks.borrow().is_empty()
     }
 
-    pub fn block_on<'b: 'a, F>(&self, future: F)
+    /// Drive the executor until `future` completes and return its output.
+    /// Other queued tasks keep running until the queue is empty.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the queue runs dry while `future` is still pending. Nothing can
+    /// wake it at that point, since this thread is busy inside `block_on`.
+    pub fn block_on<'b: 'a, F>(&self, future: F) -> F::Output
     where
-        F: Future<Output = ()> + 'b,
+        F: Future + 'b,
+        F::Output: 'a,
     {
-        let task = self.spawn(future);
+        let output = Rc::new(RefCell::new(None));
+
+        let slot = output.clone();
+        let task = self.spawn(async move {
+            let value = future.await;
+            *slot.borrow_mut() = Some(value);
+        });
         task.detach();
 
         while self.has_tasks() {
             self.process_tasks(usize::MAX);
         }
+
+        output
+            .borrow_mut()
+            .take()
+            .expect("block_on: future is still pending but no tasks are left to drive it (deadlock)")
     }
 }
 
@@ -444,5 +463,755 @@ mod tests {
         assert!(!executor.has_tasks());
         assert_eq!(output.borrow().as_slice(), &[1, 2]);
         assert_eq!(waker.wake_count.get(), 3);
+    }
+    /// Sets a flag when dropped, so tests can observe when a future is released.
+    struct DropFlag(Rc<Cell<bool>>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.set(true);
+        }
+    }
+
+    /// Returns `Pending` once and wakes itself, mimicking a cooperative yield.
+    struct YieldNow(bool);
+
+    impl Future for YieldNow {
+        type Output = ();
+
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> core::task::Poll<()> {
+            if self.0 {
+                core::task::Poll::Ready(())
+            } else {
+                self.0 = true;
+                cx.waker().wake_by_ref();
+                core::task::Poll::Pending
+            }
+        }
+    }
+
+    fn yield_now() -> YieldNow {
+        YieldNow(false)
+    }
+
+    /// Stays pending until `ready` is set, storing the latest waker in `slot`.
+    struct WaitFor {
+        ready: Rc<Cell<bool>>,
+        slot: Rc<RefCell<Option<Waker>>>,
+    }
+
+    impl Future for WaitFor {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> core::task::Poll<()> {
+            if self.ready.get() {
+                core::task::Poll::Ready(())
+            } else {
+                *self.slot.borrow_mut() = Some(cx.waker().clone());
+                core::task::Poll::Pending
+            }
+        }
+    }
+
+    fn new_executor() -> (Executor<'static, TestWaker>, Rc<TestWaker>) {
+        let waker = Rc::new(TestWaker::default());
+        (Executor::new(waker.clone()), waker)
+    }
+
+    fn queue_len<T>(executor: &Executor<'_, T>) -> usize {
+        executor.state.tasks.borrow().len()
+    }
+
+    #[test]
+    fn spawn_does_not_poll_eagerly() {
+        let (executor, _) = new_executor();
+        let ran = Rc::new(Cell::new(false));
+
+        let flag = ran.clone();
+        executor.spawn(async move { flag.set(true) }).detach();
+
+        assert!(!ran.get());
+        executor.process_tasks(usize::MAX);
+        assert!(ran.get());
+    }
+
+    #[test]
+    fn new_executor_has_no_tasks() {
+        let (executor, waker) = new_executor();
+
+        assert!(!executor.has_tasks());
+        assert_eq!(waker.wake_count.get(), 0);
+        executor.process_tasks(usize::MAX);
+        assert!(!executor.has_tasks());
+    }
+
+    #[test]
+    fn process_tasks_with_zero_count_does_nothing() {
+        let (executor, _) = new_executor();
+        let ran = Rc::new(Cell::new(false));
+
+        let flag = ran.clone();
+        executor.spawn(async move { flag.set(true) }).detach();
+
+        executor.process_tasks(0);
+        assert!(!ran.get());
+        assert!(executor.has_tasks());
+    }
+
+    #[test]
+    fn process_tasks_with_count_above_queue_len_runs_everything() {
+        let (executor, _) = new_executor();
+        let counter = Rc::new(Cell::new(0));
+
+        for _ in 0..3 {
+            let counter = counter.clone();
+            executor
+                .spawn(async move { counter.set(counter.get() + 1) })
+                .detach();
+        }
+
+        executor.process_tasks(10);
+        assert_eq!(counter.get(), 3);
+        assert!(!executor.has_tasks());
+    }
+
+    #[test]
+    fn each_spawn_wakes_event_loop_once() {
+        let (executor, waker) = new_executor();
+
+        for expected in 1..=5 {
+            executor.spawn(future::ready(())).detach();
+            assert_eq!(waker.wake_count.get(), expected);
+        }
+
+        assert_eq!(queue_len(&executor), 5);
+    }
+
+    #[test]
+    fn dropping_handle_before_poll_cancels_task() {
+        let (executor, _) = new_executor();
+        let ran = Rc::new(Cell::new(false));
+        let dropped = Rc::new(Cell::new(false));
+
+        let flag = ran.clone();
+        let guard = DropFlag(dropped.clone());
+        let task = executor.spawn(async move {
+            let _guard = guard;
+            flag.set(true);
+        });
+
+        drop(task);
+        // The future is released as soon as the handle goes away.
+        assert!(dropped.get());
+
+        executor.process_tasks(usize::MAX);
+        assert!(!ran.get());
+        assert!(!executor.has_tasks());
+    }
+
+    #[test]
+    fn dropping_handle_of_pending_task_drops_future() {
+        let (executor, _) = new_executor();
+        let dropped = Rc::new(Cell::new(false));
+        let ready = Rc::new(Cell::new(false));
+        let slot = Rc::new(RefCell::new(None));
+
+        let guard = DropFlag(dropped.clone());
+        let wait = WaitFor {
+            ready: ready.clone(),
+            slot: slot.clone(),
+        };
+        let task = executor.spawn(async move {
+            let _guard = guard;
+            wait.await;
+        });
+
+        executor.process_tasks(usize::MAX);
+        assert!(!dropped.get());
+        assert!(slot.borrow().is_some());
+
+        drop(task);
+        assert!(dropped.get());
+
+        // Waking a canceled task must not requeue it.
+        ready.set(true);
+        slot.borrow_mut().take().unwrap().wake();
+        assert!(!executor.has_tasks());
+    }
+
+    #[test]
+    fn detached_task_keeps_running_after_handle_is_gone() {
+        let (executor, _) = new_executor();
+        let ready = Rc::new(Cell::new(false));
+        let slot = Rc::new(RefCell::new(None));
+        let done = Rc::new(Cell::new(false));
+
+        let wait = WaitFor {
+            ready: ready.clone(),
+            slot: slot.clone(),
+        };
+        let flag = done.clone();
+        executor
+            .spawn(async move {
+                wait.await;
+                flag.set(true);
+            })
+            .detach();
+
+        executor.process_tasks(usize::MAX);
+        assert!(!done.get());
+
+        ready.set(true);
+        slot.borrow_mut().take().unwrap().wake();
+        assert!(executor.has_tasks());
+
+        executor.process_tasks(usize::MAX);
+        assert!(done.get());
+    }
+
+    #[test]
+    fn held_handle_keeps_task_alive() {
+        let (executor, _) = new_executor();
+        let counter = Rc::new(Cell::new(0));
+
+        let count = counter.clone();
+        let task = executor.spawn(async move {
+            for _ in 0..3 {
+                count.set(count.get() + 1);
+                yield_now().await;
+            }
+        });
+
+        while executor.has_tasks() {
+            executor.process_tasks(usize::MAX);
+        }
+
+        assert_eq!(counter.get(), 3);
+        drop(task);
+    }
+
+    #[test]
+    fn future_is_dropped_on_completion() {
+        let (executor, _) = new_executor();
+        let dropped = Rc::new(Cell::new(false));
+
+        let guard = DropFlag(dropped.clone());
+        let task = executor.spawn(async move {
+            let _guard = guard;
+        });
+
+        executor.process_tasks(usize::MAX);
+        assert!(dropped.get());
+        drop(task);
+    }
+
+    #[test]
+    fn multiple_wakes_before_poll_queue_task_once() {
+        let (executor, waker) = new_executor();
+        let ready = Rc::new(Cell::new(false));
+        let slot = Rc::new(RefCell::new(None));
+        let polls = Rc::new(Cell::new(0));
+
+        let wait_ready = ready.clone();
+        let wait_slot = slot.clone();
+        let poll_count = polls.clone();
+        executor
+            .spawn(future::poll_fn(move |cx| {
+                poll_count.set(poll_count.get() + 1);
+                let mut wait = WaitFor {
+                    ready: wait_ready.clone(),
+                    slot: wait_slot.clone(),
+                };
+                Pin::new(&mut wait).poll(cx)
+            }))
+            .detach();
+
+        executor.process_tasks(usize::MAX);
+        assert_eq!(polls.get(), 1);
+        assert_eq!(waker.wake_count.get(), 1);
+
+        let stored = slot.borrow().clone().unwrap();
+        stored.wake_by_ref();
+        stored.wake_by_ref();
+        stored.clone().wake();
+
+        assert_eq!(queue_len(&executor), 1);
+        assert_eq!(waker.wake_count.get(), 2);
+
+        executor.process_tasks(usize::MAX);
+        assert_eq!(polls.get(), 2);
+        assert!(!executor.has_tasks());
+    }
+
+    #[test]
+    fn waking_completed_task_is_ignored() {
+        let (executor, waker) = new_executor();
+        let slot: Rc<RefCell<Option<Waker>>> = Rc::new(RefCell::new(None));
+
+        let captured = slot.clone();
+        executor
+            .spawn(future::poll_fn(move |cx| {
+                *captured.borrow_mut() = Some(cx.waker().clone());
+                core::task::Poll::Ready(())
+            }))
+            .detach();
+
+        executor.process_tasks(usize::MAX);
+        assert_eq!(waker.wake_count.get(), 1);
+
+        let stored = slot.borrow_mut().take().unwrap();
+        stored.wake_by_ref();
+        stored.wake();
+
+        assert!(!executor.has_tasks());
+        assert_eq!(waker.wake_count.get(), 1);
+    }
+
+    #[test]
+    fn waker_outliving_executor_is_harmless() {
+        let slot: Rc<RefCell<Option<Waker>>> = Rc::new(RefCell::new(None));
+        let ready = Rc::new(Cell::new(false));
+
+        {
+            let (executor, _) = new_executor();
+            executor
+                .spawn(WaitFor {
+                    ready: ready.clone(),
+                    slot: slot.clone(),
+                })
+                .detach();
+            executor.process_tasks(usize::MAX);
+        }
+
+        let stored = slot.borrow_mut().take().unwrap();
+        stored.wake_by_ref();
+        let cloned = stored.clone();
+        stored.wake();
+        drop(cloned);
+    }
+
+    #[test]
+    fn dropping_executor_releases_queued_futures() {
+        let dropped = Rc::new(Cell::new(false));
+
+        {
+            let (executor, _) = new_executor();
+            let guard = DropFlag(dropped.clone());
+            executor
+                .spawn(async move {
+                    let _guard = guard;
+                })
+                .detach();
+            assert!(executor.has_tasks());
+        }
+
+        assert!(dropped.get());
+    }
+
+    #[test]
+    fn dropping_executor_releases_pending_futures_without_wakers() {
+        let dropped = Rc::new(Cell::new(false));
+        let slot = Rc::new(RefCell::new(None));
+
+        {
+            let (executor, _) = new_executor();
+            let guard = DropFlag(dropped.clone());
+            let wait = WaitFor {
+                ready: Rc::new(Cell::new(false)),
+                slot: slot.clone(),
+            };
+            executor
+                .spawn(async move {
+                    let _guard = guard;
+                    wait.await;
+                })
+                .detach();
+            executor.process_tasks(usize::MAX);
+            assert!(!dropped.get());
+        }
+
+        // The stored waker still owns the task, so the future lives on until the waker goes.
+        assert!(!dropped.get());
+        slot.borrow_mut().take();
+        assert!(dropped.get());
+    }
+
+    #[test]
+    fn waker_clones_keep_task_alive_and_release_it_when_dropped() {
+        let (executor, _) = new_executor();
+        let slot = Rc::new(RefCell::new(None));
+        let dropped = Rc::new(Cell::new(false));
+
+        let guard = DropFlag(dropped.clone());
+        let wait = WaitFor {
+            ready: Rc::new(Cell::new(false)),
+            slot: slot.clone(),
+        };
+        executor
+            .spawn(async move {
+                let _guard = guard;
+                wait.await;
+            })
+            .detach();
+        executor.process_tasks(usize::MAX);
+
+        let clones: Vec<Waker> = (0..4).map(|_| slot.borrow().clone().unwrap()).collect();
+        slot.borrow_mut().take();
+        drop(clones);
+
+        // Detached and no wakers left: nothing can resume the task, so it is freed.
+        assert!(dropped.get());
+        drop(executor);
+    }
+
+    #[test]
+    fn yielding_task_is_requeued_for_next_batch() {
+        let (executor, _) = new_executor();
+        let output = Rc::new(RefCell::new(Vec::new()));
+
+        let captured = output.clone();
+        executor
+            .spawn(async move {
+                captured.borrow_mut().push("a1");
+                yield_now().await;
+                captured.borrow_mut().push("a2");
+            })
+            .detach();
+
+        let captured = output.clone();
+        executor
+            .spawn(async move {
+                captured.borrow_mut().push("b1");
+            })
+            .detach();
+
+        executor.process_tasks(usize::MAX);
+        assert_eq!(output.borrow().as_slice(), &["a1", "b1"]);
+        assert!(executor.has_tasks());
+
+        executor.process_tasks(usize::MAX);
+        assert_eq!(output.borrow().as_slice(), &["a1", "b1", "a2"]);
+        assert!(!executor.has_tasks());
+    }
+
+    #[test]
+    fn yielding_tasks_interleave_round_robin() {
+        let (executor, _) = new_executor();
+        let output = Rc::new(RefCell::new(Vec::new()));
+
+        for id in 0..3 {
+            let output = output.clone();
+            executor
+                .spawn(async move {
+                    for step in 0..3 {
+                        output.borrow_mut().push((id, step));
+                        yield_now().await;
+                    }
+                })
+                .detach();
+        }
+
+        while executor.has_tasks() {
+            executor.process_tasks(usize::MAX);
+        }
+
+        let expected: Vec<_> = (0..3)
+            .flat_map(|step| (0..3).map(move |id| (id, step)))
+            .collect();
+        assert_eq!(*output.borrow(), expected);
+    }
+
+    #[test]
+    fn task_spawned_while_processing_runs_in_next_batch() {
+        let (executor, _) = new_executor();
+        let output = Rc::new(RefCell::new(Vec::new()));
+
+        let inner_executor = executor.clone();
+        let captured = output.clone();
+        executor
+            .spawn(async move {
+                captured.borrow_mut().push("outer");
+                let nested = captured.clone();
+                inner_executor
+                    .spawn(async move {
+                        nested.borrow_mut().push("inner");
+                    })
+                    .detach();
+            })
+            .detach();
+
+        executor.process_tasks(usize::MAX);
+        assert_eq!(output.borrow().as_slice(), &["outer"]);
+        assert!(executor.has_tasks());
+
+        executor.process_tasks(usize::MAX);
+        assert_eq!(output.borrow().as_slice(), &["outer", "inner"]);
+    }
+
+    #[test]
+    fn cancelling_queued_task_from_another_task_skips_it() {
+        let (executor, _) = new_executor();
+        let ran = Rc::new(Cell::new(false));
+        let handle = Rc::new(RefCell::new(None));
+
+        let canceler = handle.clone();
+        executor
+            .spawn(async move {
+                canceler.borrow_mut().take();
+            })
+            .detach();
+
+        let flag = ran.clone();
+        *handle.borrow_mut() = Some(executor.spawn(async move { flag.set(true) }));
+
+        executor.process_tasks(usize::MAX);
+        assert!(!ran.get());
+        assert!(handle.borrow().is_none());
+        assert!(!executor.has_tasks());
+    }
+
+    #[test]
+    fn task_can_cancel_itself_while_running() {
+        let (executor, _) = new_executor();
+        let handle: Rc<RefCell<Option<ExcutorTask<'static, TestWaker>>>> =
+            Rc::new(RefCell::new(None));
+        let dropped = Rc::new(Cell::new(false));
+        let after_cancel = Rc::new(Cell::new(false));
+
+        let own_handle = handle.clone();
+        let guard = DropFlag(dropped.clone());
+        let flag = after_cancel.clone();
+        let task = executor.spawn(async move {
+            let _guard = guard;
+            own_handle.borrow_mut().take();
+            yield_now().await;
+            flag.set(true);
+        });
+        *handle.borrow_mut() = Some(task);
+
+        executor.process_tasks(usize::MAX);
+        assert!(dropped.get());
+        assert!(!executor.has_tasks());
+        assert!(!after_cancel.get());
+    }
+
+    #[test]
+    fn cloned_executors_share_the_queue() {
+        let (executor, waker) = new_executor();
+        let other = executor.clone();
+        let counter = Rc::new(Cell::new(0));
+
+        let count = counter.clone();
+        other
+            .spawn(async move { count.set(count.get() + 1) })
+            .detach();
+        assert!(executor.has_tasks());
+
+        executor.process_tasks(usize::MAX);
+        assert_eq!(counter.get(), 1);
+        assert!(!other.has_tasks());
+        assert_eq!(waker.wake_count.get(), 1);
+    }
+
+    #[test]
+    fn tick_reports_whether_work_was_done() {
+        use crate::spawner::DriverableSpawner;
+
+        let (executor, _) = new_executor();
+        assert!(!executor.tick());
+
+        let counter = Rc::new(Cell::new(0));
+        let count = counter.clone();
+        executor
+            .spawn(async move {
+                count.set(count.get() + 1);
+                yield_now().await;
+                count.set(count.get() + 1);
+            })
+            .detach();
+
+        assert!(executor.tick());
+        assert_eq!(counter.get(), 1);
+        assert!(executor.tick());
+        assert_eq!(counter.get(), 2);
+        assert!(!executor.tick());
+    }
+
+    #[test]
+    fn block_on_runs_future_to_completion() {
+        let (executor, _) = new_executor();
+        let counter = Rc::new(Cell::new(0));
+
+        let count = counter.clone();
+        executor.block_on(async move {
+            for _ in 0..5 {
+                count.set(count.get() + 1);
+                yield_now().await;
+            }
+        });
+
+        assert_eq!(counter.get(), 5);
+        assert!(!executor.has_tasks());
+    }
+
+    #[test]
+    fn block_on_drives_nested_spawns() {
+        let (executor, _) = new_executor();
+        let output = Rc::new(RefCell::new(Vec::new()));
+
+        let spawner = executor.clone();
+        let captured = output.clone();
+        executor.block_on(async move {
+            for value in 0..3 {
+                let captured = captured.clone();
+                spawner
+                    .spawn(async move {
+                        yield_now().await;
+                        captured.borrow_mut().push(value);
+                    })
+                    .detach();
+            }
+        });
+
+        assert_eq!(output.borrow().as_slice(), &[0, 1, 2]);
+        assert!(!executor.has_tasks());
+    }
+
+    #[test]
+    fn block_on_also_drives_previously_spawned_tasks() {
+        let (executor, _) = new_executor();
+        let output = Rc::new(RefCell::new(Vec::new()));
+
+        let captured = output.clone();
+        executor
+            .spawn(async move { captured.borrow_mut().push("before") })
+            .detach();
+
+        let captured = output.clone();
+        executor.block_on(async move { captured.borrow_mut().push("block_on") });
+
+        assert_eq!(output.borrow().as_slice(), &["before", "block_on"]);
+    }
+
+    #[test]
+    fn block_on_returns_future_output() {
+        let (executor, _) = new_executor();
+
+        let value = executor.block_on(async {
+            yield_now().await;
+            21 * 2
+        });
+
+        assert_eq!(value, 42);
+    }
+
+    #[test]
+    fn block_on_waits_for_wake_from_another_task() {
+        let (executor, _) = new_executor();
+        let ready = Rc::new(Cell::new(false));
+        let slot: Rc<RefCell<Option<Waker>>> = Rc::new(RefCell::new(None));
+
+        let wake_ready = ready.clone();
+        let wake_slot = slot.clone();
+        executor
+            .spawn(async move {
+                // Let the blocked future register its waker first.
+                yield_now().await;
+                wake_ready.set(true);
+                if let Some(waker) = wake_slot.borrow_mut().take() {
+                    waker.wake();
+                }
+            })
+            .detach();
+
+        let value = executor.block_on(async move {
+            WaitFor { ready, slot }.await;
+            "done"
+        });
+
+        assert_eq!(value, "done");
+        assert!(!executor.has_tasks());
+    }
+
+    #[test]
+    #[should_panic(expected = "deadlock")]
+    fn block_on_panics_when_future_can_never_complete() {
+        let (executor, _) = new_executor();
+
+        executor.block_on(WaitFor {
+            ready: Rc::new(Cell::new(false)),
+            slot: Rc::new(RefCell::new(None)),
+        });
+    }
+
+    #[test]
+    fn executor_can_run_futures_borrowing_local_data() {
+        let waker = Rc::new(TestWaker::default());
+        let mut values = Vec::new();
+        let total = Cell::new(0);
+
+        {
+            let executor = Executor::new(waker);
+            let values = &mut values;
+            let total = &total;
+            executor.block_on(async move {
+                for value in 1..=4 {
+                    values.push(value);
+                    total.set(total.get() + value);
+                    yield_now().await;
+                }
+            });
+        }
+
+        assert_eq!(values, [1, 2, 3, 4]);
+        assert_eq!(total.get(), 10);
+    }
+
+    #[test]
+    fn oneshot_channel_wakes_waiting_task() {
+        let (executor, _) = new_executor();
+        let (tx, rx) = crate::channel::oneshot::channel::<u32>();
+        let received = Rc::new(Cell::new(None));
+
+        let slot = received.clone();
+        executor
+            .spawn(async move {
+                slot.set(rx.await.ok());
+            })
+            .detach();
+
+        executor.process_tasks(usize::MAX);
+        assert!(!executor.has_tasks());
+        assert_eq!(received.get(), None);
+
+        tx.send(42).unwrap();
+        while executor.has_tasks() {
+            executor.process_tasks(usize::MAX);
+        }
+        assert_eq!(received.get(), Some(42));
+    }
+
+    #[test]
+    fn many_tasks_complete() {
+        let (executor, waker) = new_executor();
+        let counter = Rc::new(Cell::new(0usize));
+
+        for _ in 0..1000 {
+            let count = counter.clone();
+            executor
+                .spawn(async move {
+                    yield_now().await;
+                    count.set(count.get() + 1);
+                })
+                .detach();
+        }
+
+        executor.process_tasks(usize::MAX);
+        assert_eq!(counter.get(), 0);
+        executor.process_tasks(usize::MAX);
+        assert_eq!(counter.get(), 1000);
+        assert!(!executor.has_tasks());
+        // One wake per spawn and one per yield.
+        assert_eq!(waker.wake_count.get(), 2000);
     }
 }
