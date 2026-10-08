@@ -20,3 +20,10 @@ compio = { version = "0.19", optional = true }
 
 [dev-dependencies]
 pollster = "1.0"
+criterion = "0.5"
+futures = { version = "0.3", features = ["executor"] }
+
+[[bench]]
+name = "executor"
+harness = false
+required-features = ["executor"]
