@@ -1,31 +1,189 @@
 use core::{
-    cell::{Cell, RefCell},
+    cell::{Cell, RefCell, UnsafeCell},
+    ops::{Deref, DerefMut},
     pin::Pin,
-    task::{Context, RawWaker, RawWakerVTable, Waker},
+    sync::atomic::{AtomicBool, AtomicU8, Ordering},
+    task::{Context, Waker},
 };
 
 use alloc::{
     boxed::Box,
+    collections::{BTreeMap, VecDeque},
     rc::{Rc, Weak},
+    sync::Arc,
+    task::Wake,
     vec::Vec,
 };
 
 use goerdet::{LocalSpawner, Task};
 
 /// A trait for waking up the event loop when a task is scheduled.
-pub trait EventLoopWaker {
+///
+/// Task wakers may be used from any thread, so the event loop waker must be
+/// `Send + Sync`. Spawned futures themselves never leave the executor's thread.
+pub trait EventLoopWaker: Send + Sync {
     fn wake(&self);
 }
 
 // Tasks stay boxed so the executor can keep polling futures that borrow from `'a`.
 type BoxFuture<'a> = Pin<Box<dyn Future<Output = ()> + 'a>>;
 
-struct ExecutorState<'a, T> {
-    // The queue stores task cells so a future can reschedule itself safely.
-    tasks: RefCell<Vec<Rc<TaskCell<'a, T>>>>,
-    waker: Rc<T>,
+// Header state flags.
+// Prevents the same task from being enqueued multiple times before it is polled.
+const QUEUED: u8 = 1 << 0;
+// Canceled tasks drop their future and ignore any later wake-ups.
+const CANCELED: u8 = 1 << 1;
+// Completed tasks should never be queued again.
+const COMPLETED: u8 = 1 << 2;
+
+/// A minimal spin lock, since `no_std` has no `Mutex`.
+/// Critical sections only push to or drain the inbox, so contention is short.
+struct SpinLock<V> {
+    locked: AtomicBool,
+    value: UnsafeCell<V>,
 }
 
+// SAFETY: access to `value` is serialized by `locked`.
+unsafe impl<V: Send> Sync for SpinLock<V> {}
+
+impl<V> SpinLock<V> {
+    fn new(value: V) -> Self {
+        Self {
+            locked: AtomicBool::new(false),
+            value: UnsafeCell::new(value),
+        }
+    }
+
+    fn lock(&self) -> SpinGuard<'_, V> {
+        while self
+            .locked
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+        SpinGuard { lock: self }
+    }
+}
+
+struct SpinGuard<'l, V> {
+    lock: &'l SpinLock<V>,
+}
+
+impl<V> Deref for SpinGuard<'_, V> {
+    type Target = V;
+
+    fn deref(&self) -> &V {
+        // SAFETY: the guard holds the lock.
+        unsafe { &*self.lock.value.get() }
+    }
+}
+
+impl<V> DerefMut for SpinGuard<'_, V> {
+    fn deref_mut(&mut self) -> &mut V {
+        // SAFETY: the guard holds the lock.
+        unsafe { &mut *self.lock.value.get() }
+    }
+}
+
+impl<V> Drop for SpinGuard<'_, V> {
+    fn drop(&mut self) {
+        self.lock.locked.store(false, Ordering::Release);
+    }
+}
+
+/// The thread-safe part of the executor, reachable from any waker.
+struct Shared<T> {
+    inbox: SpinLock<VecDeque<Arc<Header<T>>>>,
+    notifier: Arc<T>,
+    // Set once the executor is gone so late wake-ups become no-ops.
+    closed: AtomicBool,
+}
+
+/// The thread-safe part of a task. Wakers only ever hold this, never the future.
+struct Header<T> {
+    state: AtomicU8,
+    id: u64,
+    shared: Arc<Shared<T>>,
+}
+
+impl<T> Header<T> {
+    fn is_finished(&self) -> bool {
+        self.state.load(Ordering::Acquire) & (CANCELED | COMPLETED) != 0
+    }
+}
+
+impl<T> Header<T>
+where
+    T: EventLoopWaker,
+{
+    fn schedule(self: &Arc<Self>) {
+        if self.is_finished() || self.shared.closed.load(Ordering::Acquire) {
+            return;
+        }
+
+        // Queue the task exactly once until it gets polled again.
+        if self.state.fetch_or(QUEUED, Ordering::AcqRel) & QUEUED != 0 {
+            return;
+        }
+
+        self.shared.inbox.lock().push_back(self.clone());
+        self.shared.notifier.wake();
+    }
+}
+
+impl<T> Wake for Header<T>
+where
+    T: EventLoopWaker + 'static,
+{
+    fn wake(self: Arc<Self>) {
+        self.schedule();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.schedule();
+    }
+}
+
+/// The thread-local part of a task: the future itself, owned by the executor.
+struct Slot<'a, T> {
+    // The future is taken out while polling so wake-ups cannot alias the active borrow.
+    future: Option<BoxFuture<'a>>,
+    header: Arc<Header<T>>,
+}
+
+struct ExecutorState<'a, T> {
+    // Futures live here, so they are only ever polled and dropped on this thread.
+    slots: RefCell<BTreeMap<u64, Slot<'a, T>>>,
+    // Ids are never reused, so a stale inbox entry can never hit another task.
+    next_id: Cell<u64>,
+    shared: Arc<Shared<T>>,
+}
+
+impl<'a, T> Drop for ExecutorState<'a, T> {
+    fn drop(&mut self) {
+        self.shared.closed.store(true, Ordering::Release);
+        let inbox = core::mem::take(&mut *self.shared.inbox.lock());
+        drop(inbox);
+
+        // Drop every future here, while the data they borrow for `'a` is still alive.
+        let slots = core::mem::take(self.slots.get_mut());
+        for slot in slots.values() {
+            slot.header.state.fetch_or(CANCELED, Ordering::AcqRel);
+        }
+        drop(slots);
+    }
+}
+
+/// A single-threaded executor.
+///
+/// Spawned futures need not be `Send`: they are only ever polled and dropped
+/// on the executor's thread. Their wakers are thread-safe and may be woken
+/// from anywhere.
+///
+/// The executor owns every spawned future until it completes or is canceled.
+/// A pending task that holds a clone of its own executor therefore keeps the
+/// executor alive, and both are leaked.
 pub struct Executor<'lifetime, T> {
     state: Rc<ExecutorState<'lifetime, T>>,
 }
@@ -40,34 +198,79 @@ impl<'lifetime, T> Clone for Executor<'lifetime, T> {
 
 impl<'a, T> Executor<'a, T>
 where
-    T: EventLoopWaker,
+    T: EventLoopWaker + 'static,
 {
-    pub fn new(waker: Rc<T>) -> Self {
+    pub fn new(waker: Arc<T>) -> Self {
         Self {
             state: Rc::new(ExecutorState {
-                tasks: RefCell::new(Vec::new()),
-                waker,
+                slots: RefCell::new(BTreeMap::new()),
+                next_id: Cell::new(0),
+                shared: Arc::new(Shared {
+                    inbox: SpinLock::new(VecDeque::new()),
+                    notifier: waker,
+                    closed: AtomicBool::new(false),
+                }),
             }),
         }
     }
 
     /// Process a number of tasks in the executor's queue.
-    /// This will run the tasks in the order they were spawned.
+    /// This will run the tasks in the order they were scheduled.
     pub fn process_tasks(&self, count: usize) {
         let tasks_to_run = {
-            let mut tasks = self.state.tasks.borrow_mut();
-            let count = count.min(tasks.len());
-            tasks.drain(..count).collect::<Vec<_>>()
+            let mut inbox = self.state.shared.inbox.lock();
+            let count = count.min(inbox.len());
+            inbox.drain(..count).collect::<Vec<_>>()
         };
 
-        for task in tasks_to_run {
-            task.poll();
+        for header in tasks_to_run {
+            self.run(header);
         }
+    }
+
+    fn run(&self, header: Arc<Header<T>>) {
+        if header.is_finished() {
+            return;
+        }
+
+        header.state.fetch_and(!QUEUED, Ordering::AcqRel);
+
+        let future = self
+            .state
+            .slots
+            .borrow_mut()
+            .get_mut(&header.id)
+            .and_then(|slot| slot.future.take());
+        let Some(mut future) = future else {
+            return;
+        };
+
+        let waker = Waker::from(header.clone());
+        let mut cx = Context::from_waker(&waker);
+
+        if future.as_mut().poll(&mut cx).is_ready() {
+            header.state.fetch_or(COMPLETED, Ordering::AcqRel);
+            let slot = self.state.slots.borrow_mut().remove(&header.id);
+            // Drop outside the borrow so drop code may spawn or cancel tasks.
+            drop(slot);
+            drop(future);
+            return;
+        }
+
+        // Put the future back unless the task canceled itself while running.
+        let leftover = match self.state.slots.borrow_mut().get_mut(&header.id) {
+            Some(slot) if !header.is_finished() => {
+                slot.future = Some(future);
+                None
+            }
+            _ => Some(future),
+        };
+        drop(leftover);
     }
 
     /// Check if there are any tasks in the executor's queue.
     pub fn has_tasks(&self) -> bool {
-        !self.state.tasks.borrow().is_empty()
+        !self.state.shared.inbox.lock().is_empty()
     }
 
     /// Drive the executor until `future` completes and return its output.
@@ -95,41 +298,50 @@ where
             self.process_tasks(usize::MAX);
         }
 
-        output
-            .borrow_mut()
-            .take()
-            .expect("block_on: future is still pending but no tasks are left to drive it (deadlock)")
+        output.borrow_mut().take().expect(
+            "block_on: future is still pending but no tasks are left to drive it (deadlock)",
+        )
     }
 }
 
 impl<'a, T> LocalSpawner<'a> for Executor<'a, T>
 where
-    T: EventLoopWaker,
+    T: EventLoopWaker + 'static,
 {
     type Task = ExcutorTask<'a, T>;
     fn spawn<F>(&self, task: F) -> Self::Task
     where
         F: Future<Output = ()> + 'a,
     {
-        // Each spawned future lives in a task cell so its waker can requeue it later.
-        let task = Rc::new(TaskCell {
-            future: RefCell::new(Some(Box::pin(task))),
-            state: Rc::downgrade(&self.state),
-            queued: Cell::new(false),
-            detached: Cell::new(false),
-            canceled: Cell::new(false),
-            completed: Cell::new(false),
+        let id = self.state.next_id.get();
+        self.state.next_id.set(id + 1);
+
+        let header = Arc::new(Header {
+            state: AtomicU8::new(0),
+            id,
+            shared: self.state.shared.clone(),
         });
 
-        task.schedule();
+        self.state.slots.borrow_mut().insert(
+            id,
+            Slot {
+                future: Some(Box::pin(task)),
+                header: header.clone(),
+            },
+        );
 
-        ExcutorTask { task: Some(task) }
+        header.schedule();
+
+        ExcutorTask {
+            task: Some(header),
+            state: Rc::downgrade(&self.state),
+        }
     }
 }
 
 impl<'a, T> crate::spawner::DriverableSpawner<'a> for Executor<'a, T>
 where
-    T: EventLoopWaker,
+    T: EventLoopWaker + 'static,
 {
     fn tick(&self) -> bool {
         if self.has_tasks() {
@@ -141,27 +353,25 @@ where
     }
 }
 
-struct TaskCell<'a, T> {
-    // The future is taken out while polling so wake-ups cannot alias the active borrow.
-    future: RefCell<Option<BoxFuture<'a>>>,
-    // Weak access lets queued wake-ups stop cleanly once the executor state is gone.
-    state: Weak<ExecutorState<'a, T>>,
-    // Prevents the same task from being enqueued multiple times before it is polled.
-    queued: Cell<bool>,
+pub struct ExcutorTask<'a, T> {
     // Detached tasks keep running even if their handle is dropped.
-    detached: Cell<bool>,
-    // Canceled tasks drop their future and ignore any later wake-ups.
-    canceled: Cell<bool>,
-    // Completed tasks should never be queued again.
-    completed: Cell<bool>,
+    task: Option<Arc<Header<T>>>,
+    state: Weak<ExecutorState<'a, T>>,
 }
 
-impl<'a, T> TaskCell<'a, T>
-where
-    T: EventLoopWaker,
-{
-    fn schedule(self: &Rc<Self>) {
-        if self.queued.get() || self.canceled.get() || self.completed.get() {
+impl<'a, T> Task for ExcutorTask<'a, T> {
+    fn detach(mut self) {
+        self.task.take();
+    }
+}
+
+impl<'a, T> Drop for ExcutorTask<'a, T> {
+    fn drop(&mut self) {
+        let Some(header) = self.task.take() else {
+            return;
+        };
+
+        if header.state.fetch_or(CANCELED, Ordering::AcqRel) & (CANCELED | COMPLETED) != 0 {
             return;
         }
 
@@ -169,177 +379,9 @@ where
             return;
         };
 
-        // Queue the task exactly once until it gets polled again.
-        self.queued.set(true);
-        state.tasks.borrow_mut().push(self.clone());
-        state.waker.wake();
-    }
-
-    fn poll(self: Rc<Self>) {
-        if self.canceled.get() || self.completed.get() {
-            return;
-        }
-
-        self.queued.set(false);
-
-        let Some(mut future) = self.future.borrow_mut().take() else {
-            return;
-        };
-
-        // Build a waker that routes wake-ups back into this executor queue.
-        let waker = task_waker(self.clone());
-        let mut cx = Context::from_waker(&waker);
-
-        if future.as_mut().poll(&mut cx).is_ready() {
-            self.completed.set(true);
-            return;
-        }
-
-        if self.canceled.get() {
-            return;
-        }
-
-        *self.future.borrow_mut() = Some(future);
-    }
-
-    fn cancel(&self) {
-        if self.canceled.replace(true) || self.completed.get() {
-            return;
-        }
-
-        self.future.borrow_mut().take();
-    }
-}
-
-struct TaskWakerData {
-    ptr: *const (),
-    clone_ptr: unsafe fn(*const ()) -> *const (),
-    wake_ptr: unsafe fn(*const ()),
-    wake_by_ref_ptr: unsafe fn(*const ()),
-    drop_ptr: unsafe fn(*const ()),
-}
-
-static TASK_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
-    task_waker_clone,
-    task_waker_wake,
-    task_waker_wake_by_ref,
-    task_waker_drop,
-);
-
-fn task_waker<'a, T>(task: Rc<TaskCell<'a, T>>) -> Waker
-where
-    T: EventLoopWaker,
-{
-    // Store task-specific function pointers once so the RawWaker callbacks stay monomorphic.
-    let data = Box::new(TaskWakerData {
-        ptr: Rc::into_raw(task).cast(),
-        clone_ptr: clone_task_ptr::<T>,
-        wake_ptr: wake_task_ptr::<T>,
-        wake_by_ref_ptr: wake_task_ptr_by_ref::<T>,
-        drop_ptr: drop_task_ptr::<T>,
-    });
-
-    unsafe {
-        Waker::from_raw(RawWaker::new(
-            Box::into_raw(data).cast(),
-            &TASK_WAKER_VTABLE,
-        ))
-    }
-}
-
-unsafe fn task_waker_clone(data: *const ()) -> RawWaker {
-    let data = unsafe { &*(data as *const TaskWakerData) };
-    let cloned = Box::new(TaskWakerData {
-        ptr: unsafe { (data.clone_ptr)(data.ptr) },
-        clone_ptr: data.clone_ptr,
-        wake_ptr: data.wake_ptr,
-        wake_by_ref_ptr: data.wake_by_ref_ptr,
-        drop_ptr: data.drop_ptr,
-    });
-
-    RawWaker::new(Box::into_raw(cloned).cast(), &TASK_WAKER_VTABLE)
-}
-
-unsafe fn task_waker_wake(data: *const ()) {
-    let data = unsafe { Box::from_raw(data as *mut TaskWakerData) };
-    unsafe { (data.wake_ptr)(data.ptr) };
-}
-
-unsafe fn task_waker_wake_by_ref(data: *const ()) {
-    let data = unsafe { &*(data as *const TaskWakerData) };
-    unsafe { (data.wake_by_ref_ptr)(data.ptr) };
-}
-
-unsafe fn task_waker_drop(data: *const ()) {
-    let data = unsafe { Box::from_raw(data as *mut TaskWakerData) };
-    unsafe { (data.drop_ptr)(data.ptr) };
-}
-
-unsafe fn clone_task_ptr<'a, T>(ptr: *const ()) -> *const ()
-where
-    T: EventLoopWaker,
-{
-    // Rebuild the Rc temporarily to clone it without changing the original ownership model.
-    let task = unsafe { Rc::<TaskCell<'a, T>>::from_raw(ptr.cast()) };
-    let cloned = task.clone();
-    let _ = Rc::into_raw(task);
-    Rc::into_raw(cloned).cast()
-}
-
-unsafe fn wake_task_ptr<'a, T>(ptr: *const ())
-where
-    T: EventLoopWaker,
-{
-    // `wake` consumes the waker, so the Rc rebuilt from the raw pointer is dropped here.
-    let task = unsafe { Rc::<TaskCell<'a, T>>::from_raw(ptr.cast()) };
-    task.schedule();
-}
-
-unsafe fn wake_task_ptr_by_ref<'a, T>(ptr: *const ())
-where
-    T: EventLoopWaker,
-{
-    // `wake_by_ref` must leave ownership unchanged, so the Rc is converted back into a raw pointer.
-    let task = unsafe { Rc::<TaskCell<'a, T>>::from_raw(ptr.cast()) };
-    task.schedule();
-    let _ = Rc::into_raw(task);
-}
-
-unsafe fn drop_task_ptr<'a, T>(ptr: *const ())
-where
-    T: EventLoopWaker,
-{
-    let _ = unsafe { Rc::<TaskCell<'a, T>>::from_raw(ptr.cast()) };
-}
-
-pub struct ExcutorTask<'a, T>
-where
-    T: EventLoopWaker,
-{
-    task: Option<Rc<TaskCell<'a, T>>>,
-}
-
-impl<'a, T> Task for ExcutorTask<'a, T>
-where
-    T: EventLoopWaker,
-{
-    fn detach(mut self) {
-        if let Some(task) = self.task.take() {
-            task.detached.set(true);
-        }
-    }
-}
-
-impl<'a, T> Drop for ExcutorTask<'a, T>
-where
-    T: EventLoopWaker,
-{
-    fn drop(&mut self) {
-        if let Some(task) = self.task.take() {
-            if !task.detached.get() {
-                task.cancel();
-            }
-        }
+        let slot = state.slots.borrow_mut().remove(&header.id);
+        // Drop outside the borrow so drop code may spawn or cancel tasks.
+        drop(slot);
     }
 }
 
@@ -348,30 +390,39 @@ mod tests {
     use super::*;
 
     use crate::emitter::{EventEmitter, EventTargetExt};
-    use alloc::{rc::Rc, vec, vec::Vec};
+    use alloc::{rc::Rc, sync::Arc, vec, vec::Vec};
     use core::{
         cell::{Cell, RefCell},
         future,
     };
 
+    extern crate std;
+
     #[derive(Default)]
     struct TestWaker {
-        wake_count: Cell<usize>,
+        wake_count: core::sync::atomic::AtomicUsize,
+    }
+
+    impl TestWaker {
+        fn count(&self) -> usize {
+            self.wake_count.load(core::sync::atomic::Ordering::SeqCst)
+        }
     }
 
     impl EventLoopWaker for TestWaker {
         fn wake(&self) {
-            self.wake_count.set(self.wake_count.get() + 1);
+            self.wake_count
+                .fetch_add(1, core::sync::atomic::Ordering::SeqCst);
         }
     }
 
     #[test]
     fn spawn_schedules_task_and_wakes_event_loop() {
-        let waker = Rc::new(TestWaker::default());
+        let waker = Arc::new(TestWaker::default());
         let executor = Executor::new(waker.clone());
         let task = executor.spawn(future::ready(()));
 
-        assert_eq!(waker.wake_count.get(), 1);
+        assert_eq!(waker.count(), 1);
         assert!(executor.has_tasks());
 
         task.detach();
@@ -381,7 +432,7 @@ mod tests {
 
     #[test]
     fn process_tasks_respects_count_limit() {
-        let waker = Rc::new(TestWaker::default());
+        let waker = Arc::new(TestWaker::default());
         let executor = Executor::new(waker);
         let output = Rc::new(RefCell::new(Vec::new()));
 
@@ -410,7 +461,7 @@ mod tests {
 
     #[test]
     fn tasks_run_in_spawn_order() {
-        let waker = Rc::new(TestWaker::default());
+        let waker = Arc::new(TestWaker::default());
         let executor = Executor::new(waker);
         let output = Rc::new(RefCell::new(vec![]));
 
@@ -430,7 +481,7 @@ mod tests {
 
     #[test]
     fn processing_tasks_allows_rescheduling_while_running() {
-        let waker = Rc::new(TestWaker::default());
+        let waker = Arc::new(TestWaker::default());
         let executor = Executor::new(waker.clone());
         let output = Rc::new(RefCell::new(Vec::new()));
 
@@ -462,7 +513,7 @@ mod tests {
         emitter.emit(3usize);
         assert!(!executor.has_tasks());
         assert_eq!(output.borrow().as_slice(), &[1, 2]);
-        assert_eq!(waker.wake_count.get(), 3);
+        assert_eq!(waker.count(), 3);
     }
     /// Sets a flag when dropped, so tests can observe when a future is released.
     struct DropFlag(Rc<Cell<bool>>);
@@ -513,13 +564,13 @@ mod tests {
         }
     }
 
-    fn new_executor() -> (Executor<'static, TestWaker>, Rc<TestWaker>) {
-        let waker = Rc::new(TestWaker::default());
+    fn new_executor() -> (Executor<'static, TestWaker>, Arc<TestWaker>) {
+        let waker = Arc::new(TestWaker::default());
         (Executor::new(waker.clone()), waker)
     }
 
     fn queue_len<T>(executor: &Executor<'_, T>) -> usize {
-        executor.state.tasks.borrow().len()
+        executor.state.shared.inbox.lock().len()
     }
 
     #[test]
@@ -540,7 +591,7 @@ mod tests {
         let (executor, waker) = new_executor();
 
         assert!(!executor.has_tasks());
-        assert_eq!(waker.wake_count.get(), 0);
+        assert_eq!(waker.count(), 0);
         executor.process_tasks(usize::MAX);
         assert!(!executor.has_tasks());
     }
@@ -581,7 +632,7 @@ mod tests {
 
         for expected in 1..=5 {
             executor.spawn(future::ready(())).detach();
-            assert_eq!(waker.wake_count.get(), expected);
+            assert_eq!(waker.count(), expected);
         }
 
         assert_eq!(queue_len(&executor), 5);
@@ -728,15 +779,16 @@ mod tests {
 
         executor.process_tasks(usize::MAX);
         assert_eq!(polls.get(), 1);
-        assert_eq!(waker.wake_count.get(), 1);
+        assert_eq!(waker.count(), 1);
 
         let stored = slot.borrow().clone().unwrap();
         stored.wake_by_ref();
         stored.wake_by_ref();
-        stored.clone().wake();
+        let cloned = stored.clone();
+        cloned.wake();
 
         assert_eq!(queue_len(&executor), 1);
-        assert_eq!(waker.wake_count.get(), 2);
+        assert_eq!(waker.count(), 2);
 
         executor.process_tasks(usize::MAX);
         assert_eq!(polls.get(), 2);
@@ -757,14 +809,14 @@ mod tests {
             .detach();
 
         executor.process_tasks(usize::MAX);
-        assert_eq!(waker.wake_count.get(), 1);
+        assert_eq!(waker.count(), 1);
 
         let stored = slot.borrow_mut().take().unwrap();
         stored.wake_by_ref();
         stored.wake();
 
         assert!(!executor.has_tasks());
-        assert_eq!(waker.wake_count.get(), 1);
+        assert_eq!(waker.count(), 1);
     }
 
     #[test]
@@ -809,7 +861,7 @@ mod tests {
     }
 
     #[test]
-    fn dropping_executor_releases_pending_futures_without_wakers() {
+    fn dropping_executor_releases_pending_futures_even_with_live_wakers() {
         let dropped = Rc::new(Cell::new(false));
         let slot = Rc::new(RefCell::new(None));
 
@@ -830,14 +882,13 @@ mod tests {
             assert!(!dropped.get());
         }
 
-        // The stored waker still owns the task, so the future lives on until the waker goes.
-        assert!(!dropped.get());
-        slot.borrow_mut().take();
+        // The executor owns the future, so a surviving waker does not keep it alive.
         assert!(dropped.get());
+        slot.borrow_mut().take().unwrap().wake();
     }
 
     #[test]
-    fn waker_clones_keep_task_alive_and_release_it_when_dropped() {
+    fn dropping_wakers_does_not_release_detached_task() {
         let (executor, _) = new_executor();
         let slot = Rc::new(RefCell::new(None));
         let dropped = Rc::new(Cell::new(false));
@@ -859,9 +910,191 @@ mod tests {
         slot.borrow_mut().take();
         drop(clones);
 
-        // Detached and no wakers left: nothing can resume the task, so it is freed.
-        assert!(dropped.get());
+        // Wakers no longer own the task; the executor releases it on drop.
+        assert!(!dropped.get());
         drop(executor);
+        assert!(dropped.get());
+    }
+
+    #[test]
+    fn executor_drops_borrowing_futures_before_borrowed_data() {
+        let slot = Rc::new(RefCell::new(None));
+        let log = RefCell::new(Vec::new());
+
+        struct LogOnDrop<'l>(&'l RefCell<Vec<&'static str>>);
+
+        impl Drop for LogOnDrop<'_> {
+            fn drop(&mut self) {
+                self.0.borrow_mut().push("future dropped");
+            }
+        }
+
+        {
+            let waker = Arc::new(TestWaker::default());
+            let executor = Executor::new(waker);
+            let guard = LogOnDrop(&log);
+            let wait = WaitFor {
+                ready: Rc::new(Cell::new(false)),
+                slot: slot.clone(),
+            };
+            executor
+                .spawn(async move {
+                    let _guard = guard;
+                    wait.await;
+                })
+                .detach();
+            executor.process_tasks(usize::MAX);
+            log.borrow_mut().push("executor dropping");
+        }
+
+        assert_eq!(*log.borrow(), ["executor dropping", "future dropped"]);
+        // The waker outlives `log`'s borrow without owning anything that refers to it.
+        drop(slot.borrow_mut().take());
+    }
+
+    #[test]
+    fn wakers_are_send_and_sync_while_futures_are_not() {
+        fn assert_send_sync<S: Send + Sync>(_: &S) {}
+
+        let (executor, _) = new_executor();
+        let slot = Rc::new(RefCell::new(None));
+        // `Rc` makes this future `!Send`; spawn must still accept it.
+        let not_send = Rc::new(());
+        let wait = WaitFor {
+            ready: Rc::new(Cell::new(false)),
+            slot: slot.clone(),
+        };
+        let task = executor.spawn(async move {
+            let _not_send = not_send;
+            wait.await;
+        });
+        executor.process_tasks(usize::MAX);
+
+        let waker = slot.borrow_mut().take().unwrap();
+        assert_send_sync(&waker);
+        drop(task);
+    }
+
+    #[test]
+    fn waking_from_another_thread_runs_task_on_executor_thread() {
+        let (executor, notifier) = new_executor();
+        let ready = Rc::new(Cell::new(false));
+        let slot = Rc::new(RefCell::new(None));
+        let done = Rc::new(Cell::new(false));
+
+        let wait = WaitFor {
+            ready: ready.clone(),
+            slot: slot.clone(),
+        };
+        let flag = done.clone();
+        let owner = std::thread::current().id();
+        executor
+            .spawn(async move {
+                wait.await;
+                assert_eq!(std::thread::current().id(), owner);
+                flag.set(true);
+            })
+            .detach();
+        executor.process_tasks(usize::MAX);
+        assert!(!executor.has_tasks());
+
+        ready.set(true);
+        let waker = slot.borrow_mut().take().unwrap();
+        std::thread::spawn(move || waker.wake()).join().unwrap();
+
+        // The foreign wake both queues the task and notifies the event loop.
+        assert!(executor.has_tasks());
+        assert_eq!(notifier.count(), 2);
+
+        executor.process_tasks(usize::MAX);
+        assert!(done.get());
+    }
+
+    #[test]
+    fn concurrent_wakes_from_many_threads_queue_task_once() {
+        let (executor, notifier) = new_executor();
+        let slot = Rc::new(RefCell::new(None));
+
+        executor
+            .spawn(WaitFor {
+                ready: Rc::new(Cell::new(false)),
+                slot: slot.clone(),
+            })
+            .detach();
+        executor.process_tasks(usize::MAX);
+
+        let waker = slot.borrow_mut().take().unwrap();
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let waker = waker.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..100 {
+                        waker.wake_by_ref();
+                        let clone = waker.clone();
+                        drop(clone);
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+
+        assert_eq!(queue_len(&executor), 1);
+        assert_eq!(notifier.count(), 2);
+    }
+
+    #[test]
+    fn waker_dropped_on_another_thread_after_executor_is_gone() {
+        let slot = Rc::new(RefCell::new(None));
+
+        {
+            let (executor, _) = new_executor();
+            executor
+                .spawn(WaitFor {
+                    ready: Rc::new(Cell::new(false)),
+                    slot: slot.clone(),
+                })
+                .detach();
+            executor.process_tasks(usize::MAX);
+        }
+
+        let waker = slot.borrow_mut().take().unwrap();
+        std::thread::spawn(move || {
+            waker.wake_by_ref();
+            let cloned = waker.clone();
+            cloned.wake();
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn stale_queue_entry_after_cancel_is_never_polled() {
+        let (executor, _) = new_executor();
+        let polls = Rc::new(Cell::new(0));
+
+        let count = polls.clone();
+        let task = executor.spawn(future::poll_fn(move |_| {
+            count.set(count.get() + 1);
+            core::task::Poll::<()>::Pending
+        }));
+        assert_eq!(queue_len(&executor), 1);
+
+        drop(task);
+        // The entry is still queued, but processing it must skip the canceled task.
+        assert_eq!(queue_len(&executor), 1);
+        executor.process_tasks(usize::MAX);
+        assert_eq!(polls.get(), 0);
+        assert!(!executor.has_tasks());
+
+        // Later spawns get fresh ids and are unaffected.
+        let count = polls.clone();
+        executor
+            .spawn(async move { count.set(count.get() + 10) })
+            .detach();
+        executor.process_tasks(usize::MAX);
+        assert_eq!(polls.get(), 10);
     }
 
     #[test]
@@ -1010,7 +1243,7 @@ mod tests {
         executor.process_tasks(usize::MAX);
         assert_eq!(counter.get(), 1);
         assert!(!other.has_tasks());
-        assert_eq!(waker.wake_count.get(), 1);
+        assert_eq!(waker.count(), 1);
     }
 
     #[test]
@@ -1146,7 +1379,7 @@ mod tests {
 
     #[test]
     fn executor_can_run_futures_borrowing_local_data() {
-        let waker = Rc::new(TestWaker::default());
+        let waker = Arc::new(TestWaker::default());
         let mut values = Vec::new();
         let total = Cell::new(0);
 
@@ -1212,6 +1445,6 @@ mod tests {
         assert_eq!(counter.get(), 1000);
         assert!(!executor.has_tasks());
         // One wake per spawn and one per yield.
-        assert_eq!(waker.wake_count.get(), 2000);
+        assert_eq!(waker.count(), 2000);
     }
 }

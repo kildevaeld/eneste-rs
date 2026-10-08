@@ -264,7 +264,7 @@ mod tests {
     use crate::executor::{EventLoopWaker, Executor};
     use alloc::{rc::Rc, vec::Vec};
     use core::{
-        cell::{Cell, RefCell},
+        cell::RefCell,
         future::Future,
         pin::Pin,
         task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
@@ -367,19 +367,26 @@ mod tests {
 
     #[derive(Default)]
     struct TestWaker {
-        wake_count: Cell<usize>,
+        wake_count: core::sync::atomic::AtomicUsize,
+    }
+
+    impl TestWaker {
+        fn count(&self) -> usize {
+            self.wake_count.load(core::sync::atomic::Ordering::SeqCst)
+        }
     }
 
     impl EventLoopWaker for TestWaker {
         fn wake(&self) {
-            self.wake_count.set(self.wake_count.get() + 1);
+            self.wake_count
+                .fetch_add(1, core::sync::atomic::Ordering::SeqCst);
         }
     }
 
     #[test]
     fn listen_on_processes_events_and_stops_when_callback_returns_false() {
         let emitter = Emitter::new();
-        let waker = Rc::new(TestWaker::default());
+        let waker = alloc::sync::Arc::new(TestWaker::default());
         let executor = Executor::new(waker.clone());
         let seen = Rc::new(RefCell::new(Vec::new()));
 
@@ -389,7 +396,7 @@ mod tests {
             value < 2
         });
 
-        assert_eq!(waker.wake_count.get(), 1);
+        assert_eq!(waker.count(), 1);
         assert!(executor.has_tasks());
 
         executor.process_tasks(1);
@@ -397,7 +404,7 @@ mod tests {
         assert!(seen.borrow().is_empty());
 
         emitter.emit(1usize);
-        assert_eq!(waker.wake_count.get(), 2);
+        assert_eq!(waker.count(), 2);
         assert!(executor.has_tasks());
 
         executor.process_tasks(1);
@@ -405,7 +412,7 @@ mod tests {
         assert!(!executor.has_tasks());
 
         emitter.emit(2usize);
-        assert_eq!(waker.wake_count.get(), 3);
+        assert_eq!(waker.count(), 3);
         assert!(executor.has_tasks());
 
         executor.process_tasks(1);
@@ -413,7 +420,7 @@ mod tests {
         assert!(!executor.has_tasks());
 
         emitter.emit(3usize);
-        assert_eq!(waker.wake_count.get(), 3);
+        assert_eq!(waker.count(), 3);
         assert!(!executor.has_tasks());
         assert_eq!(seen.borrow().as_slice(), &[1, 2]);
     }
