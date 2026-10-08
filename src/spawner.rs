@@ -1,4 +1,4 @@
-pub use goerdet::LocalSpawner;
+pub use goerdet::{BlockingSpawner, HasBlockingSpawner, HasLocalSpawner, LocalSpawner, Task};
 
 use crate::{Downgrade, Upgrade};
 
