@@ -1,4 +1,4 @@
-use core::{borrow::Borrow, fmt};
+use core::{borrow::Borrow, fmt, hash::Hash};
 
 use alloc::{
     rc::{Rc, Weak},
@@ -7,11 +7,18 @@ use alloc::{
 
 use crate::{Downgrade, Upgrade};
 
+#[derive(Clone)]
 pub struct Atom(Rc<str>);
 
 impl fmt::Debug for Atom {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("Atom").field(&self.as_str()).finish()
+    }
+}
+
+impl Default for Atom {
+    fn default() -> Self {
+        Self(Rc::from(""))
     }
 }
 
@@ -51,6 +58,12 @@ impl fmt::Display for Atom {
     }
 }
 
+impl Hash for Atom {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        self.as_str().hash(state);
+    }
+}
+
 impl PartialEq for Atom {
     fn eq(&self, other: &Self) -> bool {
         self.as_str() == other.as_str()
@@ -66,6 +79,20 @@ impl PartialEq<str> for Atom {
 impl PartialEq<Atom> for str {
     fn eq(&self, other: &Atom) -> bool {
         self == other.as_str()
+    }
+}
+
+impl Eq for Atom {}
+
+impl PartialOrd for Atom {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        self.as_str().partial_cmp(other.as_str())
+    }
+}
+
+impl Ord for Atom {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        self.as_str().cmp(other.as_str())
     }
 }
 
