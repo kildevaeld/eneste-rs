@@ -9,6 +9,12 @@ use crate::{Downgrade, Upgrade};
 
 pub struct Atom(Rc<str>);
 
+impl fmt::Debug for Atom {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("Atom").field(&self.as_str()).finish()
+    }
+}
+
 impl Atom {
     pub fn new(value: &str) -> Self {
         Self(Rc::from(value))
